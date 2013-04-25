@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <sys/mman.h>
 #include <linux/videodev2.h>
 #include <linux/android_pmem.h>
@@ -25,6 +26,7 @@
 #include <utils/String8.h>
 #include <utils/threads.h>
 #include <utils/WorkQueue.h>
+#include <utils/List.h>
 #include <binder/IMemory.h>
 #include <binder/MemoryBase.h>
 #include <binder/MemoryHeapBase.h>
@@ -33,6 +35,7 @@
 #include <ui/PixelFormat.h>
 #include <ui/Rect.h>
 #include <ui/GraphicBufferMapper.h>
+#include <media/stagefright/foundation/ADebug.h>
 
 #include <hardware/camera.h>
 #ifdef CAMERA_VERSION2
@@ -44,22 +47,25 @@
 #include "hal_public.h"
 #include "hwcomposer.h"
 
+#define PMEMDEVICE "/dev/pmem_camera"
+
 #define START_ADDR_ALIGN 0x1000 /* 4096 byte */
 #define STRIDE_ALIGN 0x800 /* 2048 byte */
 
-#define PREVIEW_BUFFER_CONUT 4
+#define PREVIEW_BUFFER_CONUT 5
 #define PREVIEW_BUFFER_SIZE 0x400000 //4M
 #define CAPTURE_BUFFER_COUNT 1
 
-#ifdef COPY_RECORDING_MODE
-#define RECORDING_BUFFER_NUM PREVIEW_BUFFER_CONUT
-#else
-#define RECORDING_BUFFER_NUM 1
-#endif
+#define MIN_WIDTH 640
+#define MIN_HEIGHT 480
+#define SIZE_640X480      (MIN_WIDTH*MIN_HEIGHT)
+#define SIZE_1600X1200    (1600*1200)
+#define SIZE_1024X768     (1024*768)
 
-#define DEBUG_FUNCTION 1
-#define LOG_FUNCTION_NAME ALOGE_IF(DEBUG_FUNCTION,"%d: %s() ENTER", __LINE__, __FUNCTION__);
-#define LOG_FUNCTION_NAME_EXIT ALOGE_IF(DEBUG_FUNCTION,"%d: %s() EXIT", __LINE__, __FUNCTION__);
+#define RECORDING_BUFFER_NUM 2
+
+#define LOG_FUNCTION_NAME ALOGV("%d: %s() ENTER", __LINE__, __FUNCTION__);
+#define LOG_FUNCTION_NAME_EXIT ALOGV("%d: %s() EXIT", __LINE__, __FUNCTION__);
 
 #define WHITE_BALANCEVALUES_NUM 8
 enum WhiteBalanceValues {

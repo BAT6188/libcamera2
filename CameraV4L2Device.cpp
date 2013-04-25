@@ -11,1597 +11,2043 @@
  */
 
 #define LOG_TAG "CameraV4L2Device"
-#define DEBUG_V4L2 0
-
+//#define LOG_NDEBUG 0
 #include "CameraV4L2Device.h"
 #include "JZCameraParameters.h"
 #include <sys/stat.h>
 
+//#define DEBUG_FLIP
+#define LOST_FRAME_NUM 6
+
 namespace android {
 
-     Mutex CameraV4L2Device::sLock;
-     CameraV4L2Device* CameraV4L2Device::sInstance = NULL;
+    Mutex CameraV4L2Device::sLock;
+    CameraV4L2Device* CameraV4L2Device::sInstance = NULL;
 
-     CameraV4L2Device* CameraV4L2Device::getInstance() {
-          ALOGE_IF(DEBUG_V4L2,"%s", __FUNCTION__);
-          Mutex::Autolock _l(sLock);
-          CameraV4L2Device* instance = sInstance;
-          if (instance == 0) {
-               instance = new CameraV4L2Device();
-               sInstance = instance;
-          }
-          return instance;
-     }
+    CameraV4L2Device* CameraV4L2Device::getInstance() {
+        Mutex::Autolock _l(sLock);
+        CameraV4L2Device* instance = sInstance;
+        if (instance == 0) {
+            instance = new CameraV4L2Device();
+            sInstance = instance;
+        }
+        return instance;
+    }
 
-     CameraV4L2Device::CameraV4L2Device()
-          :CameraDeviceCommon(),
-          mlock("CameraV4L2Device::lock"),
-          device_fd(-1),
-          V4L2DeviceState(DEVICE_UNINIT),
-          currentId(-1),
-          mtlb_base(0),
-          need_update(false),
-          videoIn(NULL),
-          nQueued(0),
-          nDequeued(0),
-          mframeBufferIdx(0),
-          mCurrentFrameIndex(0),
-          mPreviewFrameSize(0),
-          mCaptureFrameSize(0) {
+    CameraV4L2Device::CameraV4L2Device()
+        :CameraDeviceCommon(),
+         mlock("CameraV4L2Device::lock"),
+         device_fd(-1),
+         V4L2DeviceState(DEVICE_UNINIT),
+         currentId(-1),
+         mtlb_base(0),
+         need_update(false),
+         videoIn(NULL),
+         mMmapPreviewBufferHandle (NULL),
+         mCurrentFrameIndex(0),
+         mPreviewFrameSize(0),
+         mPreviewWidth(0),
+         mPreviewHeight(0),
+         mPreviewFps(15),
+         mAllocWidth(0),
+         mAllocHeight(0),
+         preview_use_pmem(false),
+         capture_use_pmem(false),
+         mEnablestartZoom(false),
+         pmem_device_fd(-1),
+         mpreviewFormatHal(-1),
+         mpreviewFormatV4l(-1),
+         is_capture(false),
+         io(IO_METHOD_USERPTR),
+         isChangedSize(false),
+         isSupportHighResuPre(false),
+         mReqLostFrameNum(LOST_FRAME_NUM) {
+        videoIn = (struct vdIn*)calloc(1, sizeof(struct vdIn));
+        memset(&mglobal_info, 0, sizeof(struct global_info));
+        memset(device_name, 0, 256);
+        memset(&preview_buffer, 0, sizeof(struct camera_buffer));
+        preview_buffer.fd = -1;
+        memset(&capture_buffer, 0, sizeof(struct camera_buffer));
+        capture_buffer.fd = -1;
+        for (int i = 0; i < NB_BUFFER; ++i) {
+            mPreviewBuffer[i] = NULL;
+        }
+        initGlobalInfo();
+        s.control_list = NULL;
+        s.num_controls = 0;
+        s.width_req = 0;
+        s.height_req = 0;
+    }
 
-               videoIn = (struct vdIn*)calloc(1, sizeof(struct vdIn));
-               ccc = new CameraColorConvert();
-               memset(&mglobal_info, 0, sizeof(struct global_info));
-               memset(device_name, 0, 256);
-               memset(&preview_buffer, 0, sizeof(struct camera_buffer));
-               memset(&capture_buffer, 0, sizeof(struct camera_buffer));
-          
-               for (int i = 0; i < NB_BUFFER; ++i) {
-                    mPreviewBuffer[i] = NULL;
-               }
+    void CameraV4L2Device::setDeviceCount(int num)
+    {
+        mglobal_info.sensor_count = num;
+        ALOGV("%s: set camera num: %d", __FUNCTION__, num);
+    }
 
-               initGlobalInfo();
-          }
+    void CameraV4L2Device::update_device_name(const char* deviceName, int len)
+    {
+        strncpy(device_name, deviceName, len);
+        device_name[len+1] = '\0';
+        need_update = true;
+        ALOGV("%s: set device name: %s",__FUNCTION__, deviceName);
+    }
 
-     void CameraV4L2Device::setDeviceCount(int num)
-     {
-          mglobal_info.sensor_count = num;
-     }
+    void CameraV4L2Device::initGlobalInfo(void)
+    {
+        mglobal_info.preview_buf_nr = NB_BUFFER;
+        mglobal_info.capture_buf_nr = NB_BUFFER;
+        ALOGV("%s: buffer num: %d",__FUNCTION__,NB_BUFFER);
+        return;
+    }
 
-     void CameraV4L2Device::update_device_name(const char* deviceName, int len)
-     {
-          strncpy(device_name, deviceName, len);
-          device_name[len+1] = '\0';
-          need_update = true;
-     }
+    CameraV4L2Device::~CameraV4L2Device()
+    {
+        if (videoIn != NULL) {
+            free(videoIn);
+            videoIn = NULL;
+        }
+    }
 
-     void CameraV4L2Device::initGlobalInfo(void)
-     {
-          
-          mglobal_info.preview_buf_nr = NB_BUFFER;
-          mglobal_info.capture_buf_nr = NB_BUFFER;
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return;
-     }
+    int CameraV4L2Device::allocateStream(BufferType type,camera_request_memory get_memory,
+                                         uint32_t width,
+                                         uint32_t height,
+                                         int format) {
 
-     CameraV4L2Device::~CameraV4L2Device()
-     {
-          if (ccc) {
-               delete ccc;
-               ccc = NULL;
-          }
+        if (V4L2DeviceState & DEVICE_STARTED) {
+            ALOGV("%s already start",device_name);
+            return NO_ERROR;
+        }
+        mAllocWidth = width;
+        mAllocHeight = height;
+        mPreviewFrameSize = (int)((width*height)<<1);
+        init_param(width,height,mPreviewFps);
+        switch(io) {
+        case IO_METHOD_READ:
+            return init_read(videoIn->format.fmt.pix.sizeimage,get_memory);
+            break;
+        case IO_METHOD_MMAP:
+            return init_mmap(get_memory);
+            break;
+        case IO_METHOD_USERPTR:
+            return init_userp(width, height, get_memory, format);
+            break;
+        }
+        return NO_ERROR;
+    }
 
-          Close();
-          free(videoIn);
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-     }
+    int CameraV4L2Device::init_read (unsigned int buffer_size,
+                                     camera_request_memory get_memory) {
 
+        videoIn->read_write_buffers = get_memory(-1, buffer_size, 1, NULL);
+        if (videoIn->read_write_buffers == NULL) {
+            ALOGE("Out of memory");
+            return NO_MEMORY;
+        }
+        struct dmmu_mem_info dmmu_info;
+        dmmu_info.vaddr = videoIn->read_write_buffers->data;
+        dmmu_info.size = videoIn->read_write_buffers->size;
+        dmmu_map_buffer(&dmmu_info);
+        return NO_ERROR;
+    }
 
-     int CameraV4L2Device::allocateStream(BufferType type,camera_request_memory get_memory,
-                                          uint32_t width,
-                                          uint32_t height,
-                                          int format)
-     {
-          status_t res = NO_ERROR;
+    int CameraV4L2Device::init_mmap(camera_request_memory get_memory) {
 
-          size_t size = 0;
-          int nr = 1;
-          struct camera_buffer* buf = NULL;
-          switch(type)
-          {
+        int ret = NO_ERROR;
 
-          case PREVIEW_BUFFER:
-          {
-               nr = mglobal_info.preview_buf_nr;
-               size = width * height << 1;
-               mPreviewFrameSize = (unsigned int)size;
-               buf = &preview_buffer;
-               buf->size = (size_t)size;
-               buf->common = get_memory(-1, buf->size,nr,NULL);
-               if (buf->common) {
-                    for (int i=0; i < nr; i++) {
-                         mPreviewBuffer[i] = (uint8_t*)buf->common->data + (i * buf->size);
+        ALOGV("Enter %s",__FUNCTION__);
+
+        isChangedSize = true;
+        freeStream(PREVIEW_BUFFER);
+        isChangedSize = false;
+
+        memset(&videoIn->rb, 0, sizeof(videoIn->rb));
+        videoIn->rb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        videoIn->rb.memory = V4L2_MEMORY_MMAP;
+        videoIn->rb.count = NB_BUFFER;
+
+        if (-1 == ::ioctl (device_fd, VIDIOC_REQBUFS, &videoIn->rb)) {
+            ALOGE("%s: reqbufs error:%s",__FUNCTION__, strerror(errno));
+            return BAD_VALUE;
+        }
+
+        if (videoIn->rb.count < 2) {
+            ALOGE("%s: buffer number < 2",__FUNCTION__);
+            return BAD_VALUE;
+        }
+
+        if (get_memory == NULL) {
+            return BAD_VALUE;
+        }
+
+        struct dmmu_mem_info dmmu_info;
+        for (unsigned int i=0; i<videoIn->rb.count; ++i) {
+            memset(&videoIn->buf, 0, sizeof(struct v4l2_buffer));
+            videoIn->buf.index = i;
+            videoIn->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            videoIn->buf.memory = V4L2_MEMORY_MMAP;
+            if (-1 == ::ioctl (device_fd, VIDIOC_QUERYBUF, &videoIn->buf)) {
+                ALOGE("Init: Unable to query buffer (%s)", strerror(errno));
+                return BAD_VALUE;
+            }
+
+            if (mMmapPreviewBufferHandle == NULL) {
+                mMmapPreviewBufferHandle = get_memory(-1,videoIn->buf.length, videoIn->rb.count, NULL);
+                dmmu_info.vaddr = mMmapPreviewBufferHandle->data;
+                dmmu_info.size = mMmapPreviewBufferHandle->size;
+                dmmu_map_buffer(&dmmu_info);
+            }
+            videoIn->mem_length[i] = videoIn->buf.length;
+            videoIn->mem_num++;
+            videoIn->mem[i] = mmap(NULL,
+                                   videoIn->buf.length,
+                                   PROT_READ|PROT_WRITE,
+                                   MAP_SHARED,
+                                   device_fd,
+                                   videoIn->buf.m.offset);
+            memset(&dmmu_info, 0, sizeof(struct dmmu_mem_info));
+            dmmu_info.vaddr = videoIn->mem[i];
+            dmmu_info.size = videoIn->mem_length[i];
+            dmmu_map_buffer(&dmmu_info);
+            if (videoIn->mem[i] == MAP_FAILED) {
+                ALOGE("Init: Unable to map buffer (%s)", strerror(errno));
+                return -1;
+            }
+            ret = ::ioctl(device_fd, VIDIOC_QBUF, &videoIn->buf);
+            if (ret < 0) {
+                ALOGE("Init: VIDIOC_QBUF failed, err: %s",strerror(errno));
+                return -1;
+            }
+        }
+        return NO_ERROR;
+    }
+
+    int CameraV4L2Device::init_userp(uint32_t width, uint32_t height,
+                     camera_request_memory get_memory,int format) {
+        ALOGV("Enter %s, device: %s, size: %dx%d",
+              __FUNCTION__,device_name, width, height);
+
+        int ret = NO_ERROR;
+        int size = (width*height)<<1;
+
+        if ((preview_buffer.common != NULL)
+            && (preview_buffer.common->data != NULL)) {
+            if ((size != preview_buffer.size)
+                || (preview_buffer.yuvMeta[0].format != format)) {
+                isChangedSize = true;
+                freeStream(PREVIEW_BUFFER);
+                isChangedSize = false;
+            } else {
+                goto reqbuf;
+            }
+        }
+
+        if (format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) {
+            if (initPmem(format) != NO_ERROR) {
+                return BAD_VALUE;
+            }
+       }
+
+        preview_buffer.nr = mglobal_info.preview_buf_nr;
+        preview_buffer.size = size;
+        if ((format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) && (pmem_device_fd > 0)) {
+            preview_buffer.fd = pmem_device_fd;
+            preview_use_pmem = true;
+        } else {
+            preview_buffer.fd = -1;
+            preview_use_pmem = false;
+        }
+
+        if (get_memory == NULL) {
+            return BAD_VALUE;
+        }
+
+        preview_buffer.common = get_memory(preview_buffer.fd,
+                              preview_buffer.size,preview_buffer.nr,NULL);
+        if (preview_buffer.common != NULL) {
+            for (int i=0; i<preview_buffer.nr; i++) {
+                mPreviewBuffer[i] = (uint8_t*)preview_buffer.common->data
+                 + (i * preview_buffer.size);
+            }
+
+            preview_buffer.dmmu_info.vaddr = preview_buffer.common->data;
+            preview_buffer.dmmu_info.size = preview_buffer.common->size;
+            dmmu_map_buffer(&preview_buffer.dmmu_info);
+        } else {
+            ALOGE("%s: alloc preview buffer error",__FUNCTION__);
+            return BAD_VALUE;
+        }
+
+    reqbuf:
+        mCurrentFrameIndex = 0;
+        memset(&videoIn->rb, 0, sizeof(videoIn->rb));
+        videoIn->rb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        videoIn->rb.memory = V4L2_MEMORY_USERPTR;
+        videoIn->rb.count = NB_BUFFER;
+        ret = ::ioctl(device_fd, VIDIOC_REQBUFS, &videoIn->rb);
+        if (ret < 0) {
+            ALOGE("Init: VIDIOC_REQBUFS failed: %s", strerror(errno));
+            return ret;
+        }
+
+        if (videoIn->rb.count < 2) {
+            ALOGE("Insufficient buffer memory on : %s", device_name);
+            return UNKNOWN_ERROR;
+        }
+
+        if (!preview_use_pmem) {
+#ifdef VIDIOC_SET_TLB_BASE
+            if ((mtlb_base>0) && (-1 == ::ioctl(device_fd,VIDIOC_SET_TLB_BASE,&mtlb_base))) {
+                ALOGE("%s: set tlb base error: %s",__FUNCTION__, strerror(errno));
+                return BAD_VALUE;
+            }
+#endif
+        }
+
+        for (unsigned int i = 0; i < videoIn->rb.count; ++i) {
+            memset(&videoIn->buf, 0, sizeof(struct v4l2_buffer));
+            videoIn->buf.index = i;
+            videoIn->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            videoIn->buf.memory = V4L2_MEMORY_USERPTR;
+            videoIn->buf.m.userptr = (unsigned long)mPreviewBuffer[i];
+            videoIn->buf.length = preview_buffer.size;
+            ret = ::ioctl(device_fd, VIDIOC_QBUF, &videoIn->buf);
+            if (ret < 0) {
+                ALOGE("Init: VIDIOC_QBUF failed,err: %s",strerror(errno));
+                return BAD_VALUE;
+            }
+        }
+        return NO_ERROR;
+    }
+
+    void CameraV4L2Device::dmmu_map_buffer(struct dmmu_mem_info *dmmu_info) {
+        for (int i = 0; i < (int)(dmmu_info->size); i += 0x1000) {
+            ((uint8_t*)(dmmu_info->vaddr))[i] = 0xff;
+        }
+        ((uint8_t*)(dmmu_info->vaddr))[dmmu_info->size - 1] = 0xff;
+        dmmu_map_user_memory(dmmu_info);
+    }
+
+    void CameraV4L2Device::freeStream(BufferType type) {
+
+        if (device_fd < 0 || isChangedSize) {
+            switch(io) {
+            case IO_METHOD_READ:
+                freeReadWritePreviewBuffer();
+                break;
+            case IO_METHOD_USERPTR:
+                freePreviewBuffer(type);
+                break;
+            case IO_METHOD_MMAP:
+                freeMMapPreviewBuffer();
+                break;
+            }
+        }
+    }
+
+    void CameraV4L2Device::freeReadWritePreviewBuffer(void) {
+
+        if (videoIn->read_write_buffers != NULL) {
+            struct dmmu_mem_info dmmu_info;
+            dmmu_info.vaddr = videoIn->read_write_buffers->data;
+            dmmu_info.size = videoIn->read_write_buffers->size;
+            dmmu_unmap_user_memory(&dmmu_info);
+            videoIn->read_write_buffers->release(videoIn->read_write_buffers);
+            videoIn->read_write_buffers = NULL;
+        }
+    }
+
+    void CameraV4L2Device::freeMMapPreviewBuffer(void) {
+        int ret = NO_ERROR;
+        ALOGV("Enter %s",__FUNCTION__);
+
+        struct dmmu_mem_info dmmu_info;
+        if (mMmapPreviewBufferHandle != NULL) {
+            dmmu_info.vaddr = mMmapPreviewBufferHandle->data;
+            dmmu_info.size = mMmapPreviewBufferHandle->size;
+            dmmu_unmap_user_memory(&dmmu_info);
+            mMmapPreviewBufferHandle->release(mMmapPreviewBufferHandle);
+            mMmapPreviewBufferHandle = NULL;
+        }
+
+        for (int i=0; i<videoIn->mem_num; ++i) {
+            if (videoIn->mem[i] != NULL) {
+                dmmu_info.vaddr = videoIn->mem[i];
+                dmmu_info.size = videoIn->mem_length[i];
+                dmmu_unmap_user_memory(&dmmu_info);
+                ret = munmap(videoIn->mem[i], videoIn->mem_length[i]);
+                videoIn->mem[i] = NULL;
+                videoIn->mem_length[i] = 0;
+            }
+            if (-1 == ret) {
+                ALOGE("%s: unmap %d buffer error: %s",__FUNCTION__, i, strerror(errno));
+            }
+        }
+    }
+
+    void CameraV4L2Device::freePreviewBuffer(BufferType type) {
+
+        ALOGV("Enter %s",__FUNCTION__);
+        if (type != PREVIEW_BUFFER) {
+            ALOGE("%s: don't support %d type",__FUNCTION__, type);
+            return;
+        }
+
+        if (preview_buffer.common == NULL) {
+            ALOGE("%s: %d type buffer already free",__FUNCTION__, type);
+            return;
+        }
+
+        dmmu_unmap_user_memory(&(preview_buffer.dmmu_info));
+        if (preview_use_pmem) {
+            munmap(preview_buffer.common->data,preview_buffer.common->size);
+        }
+        preview_buffer.common->release(preview_buffer.common);
+        preview_buffer.common->data = NULL;
+        preview_buffer.common = NULL;
+        preview_buffer.size = 0;
+        mCurrentFrameIndex = 0;
+        memset(&preview_buffer.yuvMeta[0], 0, sizeof(CameraYUVMeta));
+        ALOGD("%s: free preview buffer success",__FUNCTION__);
+
+        for (int i = 0; i < preview_buffer.nr; ++i) {
+            mPreviewBuffer[i] = NULL;
+        }
+    }
+
+    void* CameraV4L2Device::getCurrentFrame(void)
+    {
+        unsigned int count = 100;
+
+        while (count-- > 0) {
+            for (;;) {
+                fd_set fds;
+                struct timeval tv;
+                int r;
+                FD_ZERO (&fds);
+                FD_SET (device_fd, &fds);
+
+                tv.tv_sec = 4;
+                tv.tv_usec = 0;
+
+                r = select(device_fd + 1, &fds, NULL, NULL, &tv);
+
+                if (-1 == r) {
+                    if (EINTR == errno) {
+                        ALOGE("select error");
+                        continue;
+                    } else {
+                        ALOGE("select error!!! exit");
+                        return NULL;
                     }
-                    ALOGE_IF(DEBUG_V4L2, "%s: Alloc preview buffer nr = %d, size=%d, frame=%dx%d",
-                             __FUNCTION__, nr , buf->size,width, height);
-               }
-               mCurrentFrameIndex = 0;
-               mframeBufferIdx = 0;
-               break;
-          }
+                }
 
-          case CAPTURE_BUFFER:
-          {
-               size = width*height<<1;
-               buf = &capture_buffer;
-               buf->size = (size_t)size;
-               mCaptureFrameSize = buf->size;
-               buf->common = get_memory(-1, buf->size, nr, NULL);
-               if (buf->common) {
-                    ALOGE_IF(DEBUG_V4L2, "%s: Alloc capture buffer nr = %d,  size = %d , frame = %dx%d",
-                             __FUNCTION__, nr, buf->size, width, height);
-               }
-               break;
-          }
-
-          }
-
-          if (buf->common && buf->common->data) {
-
-              buf->dmmu_info.vaddr = buf->common->data;
-              buf->dmmu_info.size = buf->common->size;
-
-              {
-                  for (int i = 0; i < (int)(buf->common->size); i += 0x1000) {
-                      ((uint8_t*)(buf->common->data))[i] = 0xff;
-                  }
-                  ((uint8_t*)(buf->common->data))[buf->common->size - 1] = 0xff;
-              }
-
-              dmmu_map_user_memory(&(buf->dmmu_info));
-
-          }
-
-          allocV4L2Buffer();
-
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return NO_ERROR;
-     }
-
-     void CameraV4L2Device::freeStream(BufferType type)
-     {
-          struct camera_buffer* buf = &preview_buffer;
-          unsigned int i = 0;
-
-          if (type == PREVIEW_BUFFER && buf->common != NULL)
-          {
-               dmmu_unmap_user_memory(&(buf->dmmu_info));
-               buf->common->release(buf->common);
-               buf->common->data = NULL;
-               buf->size = 0;
-               mCurrentFrameIndex = 0;
-               mframeBufferIdx = 0;
-          } else if (type == CAPTURE_BUFFER && capture_buffer.common != NULL)
-          {
-               dmmu_unmap_user_memory(&(capture_buffer.dmmu_info));
-               capture_buffer.common->release(capture_buffer.common);
-               capture_buffer.common->data = NULL;
-               capture_buffer.common = NULL;
-               capture_buffer.size = 0;
-          }
-
-          freeV4L2Buffer();
-
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return;
-     }
-
-     int CameraV4L2Device::allocV4L2Buffer(void)
-     {
-          ALOGE_IF(DEBUG_V4L2,"Enter %s line = %d", __FUNCTION__, __LINE__);
-
-          int ret = NO_ERROR;
-
-          if (device_fd < 0) {
-               ALOGE("%s: Device not open device_fd < 0",__FUNCTION__);
-               return NO_INIT;
-          }
-
-          if (nQueued != 0) {
-               ALOGE("%s: Device is allocV4L2Buffer already",__FUNCTION__);
-               return ret;
-          }
-
-          memset(&videoIn->rb, 0, sizeof(videoIn->rb));
-          videoIn->rb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-          videoIn->rb.memory - V4L2_MEMORY_MMAP;
-          videoIn->rb.count = NB_BUFFER;
-          
-          ret = ::ioctl(device_fd, VIDIOC_REQBUFS, &videoIn->rb);
-          if (ret < 0) {
-               ALOGE("Init: VIDIOC_REQBUFS failed: %s", strerror(errno));
-               return ret;
-          }
-          
-          if (videoIn->rb.count < 2) {
-               ALOGE("Insufficient buffer memory on : %s", device_name);
-               return UNKNOWN_ERROR;
-          }
-
-          for (unsigned int i = 0; i < videoIn->rb.count; ++i) {
-
-               memset(&videoIn->buf, 0, sizeof(struct v4l2_buffer));
-               videoIn->buf.index = i;
-               videoIn->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-               videoIn->buf.memory = V4L2_MEMORY_MMAP;
-               
-               ret = ::ioctl(device_fd, VIDIOC_QUERYCAP, &videoIn->buf);
-               if (ret < 0) {
-                    ALOGE("Init: Unable to query buffer (%s)", strerror(errno));
-                    return ret;
-               }
-               videoIn->mem[i] = mmap(0,
-                                      videoIn->buf.length,
-                                      PROT_READ|PROT_WRITE,
-                                      MAP_SHARED,
-                                      device_fd,
-                                      videoIn->buf.m.offset);
-               if (videoIn->mem[i] == MAP_FAILED) {
-                    ALOGE("Init: Unable to map buffer (%s)", strerror(errno));
-                    return -1;
-               }
-               ret = ::ioctl(device_fd, VIDIOC_QBUF, &videoIn->buf);
-               if (ret < 0) {
-                    ALOGE("Init: VIDIOC_QBUF failed");
-                    return -1;
-               }
-               nQueued++;
-          }
-          
-          size_t tmpbuf_size = 0;
-          switch (videoIn->format.fmt.pix.pixelformat)
-          {
-          case V4L2_PIX_FMT_JPEG:
-          case V4L2_PIX_FMT_MJPEG:
-          case V4L2_PIX_FMT_UYVY:
-          case V4L2_PIX_FMT_YVYU:
-          case V4L2_PIX_FMT_YYUV:
-          case V4L2_PIX_FMT_YUV420: // only needs 3/2 bytes per pixel but we alloc 2 bytes per pixel
-          case V4L2_PIX_FMT_YVU420: // only needs 3/2 bytes per pixel but we alloc 2 bytes per pixel
-          case V4L2_PIX_FMT_Y41P:   // only needs 3/2 bytes per pixel but we alloc 2 bytes per pixel
-          case V4L2_PIX_FMT_NV12:
-          case V4L2_PIX_FMT_NV21:
-          case V4L2_PIX_FMT_NV16:
-          case V4L2_PIX_FMT_NV61:
-          case V4L2_PIX_FMT_SPCA501:
-          case V4L2_PIX_FMT_SPCA505:
-          case V4L2_PIX_FMT_SPCA508:
-          case V4L2_PIX_FMT_GREY:
-          case V4L2_PIX_FMT_Y16:
-
-          case V4L2_PIX_FMT_YUYV:
-               //  YUYV doesn't need a temp buffer but we will set it if/when
-               //  video processing disable control is checked (bayer processing).
-               //            (logitech cameras only)
-               break;
-               
-          case V4L2_PIX_FMT_SGBRG8: //0
-          case V4L2_PIX_FMT_SGRBG8: //1
-          case V4L2_PIX_FMT_SBGGR8: //2
-          case V4L2_PIX_FMT_SRGGB8: //3
-               // Raw 8 bit bayer
-               // when grabbing use:
-               //    bayer_to_rgb24(bayer_data, RGB24_data, width, height, 0..3)
-               //    rgb2yuyv(RGB24_data, pFrameBuffer, width, height)
-
-               // alloc a temp buffer for converting to YUYV
-               // rgb buffer for decoding bayer data
-               tmpbuf_size = videoIn->format.fmt.pix.width * videoIn->format.fmt.pix.height * 3;
-               if (videoIn->tmpBuffer) {
-                    free(videoIn->tmpBuffer);
-               }
-               videoIn->tmpBuffer = (uint8_t*)calloc(1, tmpbuf_size);
-               if (!videoIn->tmpBuffer) {
-                    ALOGE("Couldn't calloc %lu bytes of memory for frame buffer\n",
-                          (unsigned long)tmpbuf_size);
-                    return NO_MEMORY;
-               }
-               break;
-
-          case V4L2_PIX_FMT_RGB24:
-          case V4L2_PIX_FMT_BGR24:
-               break;
-          default:
-               ALOGE("Should never arrive (1) exit fatal");
-               return -1;
-          }
-          return NO_ERROR;
-     }
-
-     void CameraV4L2Device::freeV4L2Buffer(void)
-     {
-          int ret ;
-          
-          ALOGE_IF(DEBUG_V4L2,"Enter %s", __FUNCTION__);
-
-          if (device_fd < 0) {
-               ALOGE("Unable free V4L2 buffer, device_fd < 0");
-               return ;
-          }
-
-          memset(&videoIn->buf, 0, sizeof(videoIn->buf));
-          videoIn->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-          videoIn->buf.memory = V4L2_MEMORY_MMAP;
-
-          int DQcount = nQueued - nDequeued;
-
-          for (int i = 0; i < DQcount-1; ++i) {
-               ret = ::ioctl(device_fd, VIDIOC_QBUF, &videoIn->buf);
-               ALOGE_IF(ret<0,"Uninit: VIDIOC_DQBUF Failed");
-          }
-          nQueued = 0;
-          nDequeued = 0;
-
-          for (int i = 0; i < NB_BUFFER; i++) {
-               if (videoIn->mem[i] != NULL) {
-                    ret = munmap(videoIn->mem[i], videoIn->buf.length);
-                    ALOGE_IF(ret<0,"Uninit: Unmap failed");
-                    videoIn->mem[i] = NULL;
-               }
-          }
-          if (videoIn->tmpBuffer) {
-               free(videoIn->tmpBuffer);
-          }
-          videoIn->tmpBuffer = NULL;
-     }
-
-     void* CameraV4L2Device::getCurrentFrame(bool tp)
-     {
-          ALOGE_IF(DEBUG_V4L2,"Enter %s : line=%d",__FUNCTION__,__LINE__);
-          int ret = 0;
-
-		  static CameraYUVMeta yuvMeta;
-          uint8_t* frameBuffer = NULL;
-          int frameSize = 0;
-
-		  memset(&yuvMeta, 0, sizeof(CameraYUVMeta));
-          if (!tp && preview_buffer.common) {
-               frameBuffer = (uint8_t*)mPreviewBuffer[mframeBufferIdx];
-               if (!frameBuffer) {
-                    ALOGE("No preview buffer");
+                if (0 == r) {
+                    ALOGE("select timeout");
                     return NULL;
-               }
-               mCurrentFrameIndex = mframeBufferIdx;
-               mframeBufferIdx = (mframeBufferIdx+1) % mglobal_info.preview_buf_nr;
-               frameSize = preview_buffer.size;
-          } else if (tp && capture_buffer.common) {
-               frameBuffer = (uint8_t*)capture_buffer.common->data;
-               if (!frameBuffer) {
-                    ALOGE("No capture buffer");
+                }
+
+                if (read_frame() != NULL) {
+                    if (LOST_FRAME_NUM == mReqLostFrameNum) {
+                        goto exit_loop;
+                    } else {
+                        mReqLostFrameNum++;
+                        ALOGD("lost %d frame.",mReqLostFrameNum);
+                        continue;
+                    }
+                }
+
+                if (errno != EAGAIN) {
                     return NULL;
-               }
-               mframeBufferIdx = 0;
-               mCurrentFrameIndex = mframeBufferIdx;
-               frameSize = capture_buffer.size;
-          }
+                }
+            }
+        }
+    exit_loop:
+        CameraYUVMeta* yuvMeta = &preview_buffer.yuvMeta[0];
+        return (void*)yuvMeta;
+    }
 
-          memset(&videoIn->buf, 0, sizeof(videoIn->buf));
-          videoIn->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-          videoIn->buf.memory = V4L2_MEMORY_MMAP;
-          ret = ::ioctl(device_fd , VIDIOC_DQBUF, &videoIn->buf);
-          if (ret < 0) {
-               ALOGE("%s: VIDIOC_DQBUF failed",__FUNCTION__);
-               return NULL;
-          }
+    void* CameraV4L2Device::read_frame(void)
+    {
+        switch (io) {
+        case IO_METHOD_READ:
+            return getReadWriteCurrentFrame();
+            break;
+        case IO_METHOD_USERPTR:
+            return getUserPtrCurrentFrame();
+            break;
+        case IO_METHOD_MMAP:
+            return getMmapCurrentFrame();
+            break;
+        }
+        return NULL;
+    }
 
-          nDequeued++;
+    void* CameraV4L2Device::getReadWriteCurrentFrame(void) {
 
-          int strideOut = videoIn->outWidth << 1;
-          uint8_t* src = (uint8_t*)videoIn->mem[videoIn->buf.index];
+        if (mpreviewFormatHal != PIXEL_FORMAT_YUV422I) {
+            ALOGE("%s: don't support 0x%x format",__FUNCTION__,
+                  mpreviewFormatHal);
+            return NULL;
+        }
 
-          if (frameSize < videoIn->outFrameSize) {
-               ALOGE("%s: Insufficient space in output buffer: required: %d, got %d dropping frame",
-					 __FUNCTION__,videoIn->outFrameSize, frameSize);
-          } else {
-               switch(videoIn->format.fmt.pix.pixelformat)
-               {
-               case V4L2_PIX_FMT_UYVY:
-                    if (ccc) {
-                         ccc->uyvy_to_yuyv((uint8_t*)frameBuffer, strideOut,
-                                           src, videoIn->format.fmt.pix.bytesperline, 
-										   videoIn->outWidth, videoIn->outHeight);
+        if (-1 == read(device_fd, videoIn->read_write_buffers->data,
+                       videoIn->read_write_buffers->size)) {
+            ALOGE("%s: read buffer error: %s",__FUNCTION__, strerror(errno));
+            return NULL;
+        }
+
+        mCurrentFrameIndex = 0;
+        CameraYUVMeta* yuvMeta = &preview_buffer.yuvMeta[0];
+        memset(yuvMeta, 0, sizeof(CameraYUVMeta));
+        yuvMeta->index = 0;
+        yuvMeta->count = 1;
+        yuvMeta->width = mAllocWidth;
+        yuvMeta->height = mAllocHeight;
+        yuvMeta->yAddr = (uint32_t)videoIn->read_write_buffers->data;
+        yuvMeta->yPhy = 0;
+        yuvMeta->uPhy = 0;
+        yuvMeta->vPhy = 0;
+        yuvMeta->format = HAL_PIXEL_FORMAT_YCbCr_422_I;
+        yuvMeta->yStride = mAllocWidth << 1;
+        yuvMeta->uStride = yuvMeta->yStride;
+        yuvMeta->vStride = yuvMeta->yStride;
+        yuvMeta->uAddr = yuvMeta->yAddr;
+        yuvMeta->vAddr = yuvMeta->yAddr;
+        return (void*)yuvMeta;
+    }
+
+    void* CameraV4L2Device::getUserPtrCurrentFrame(void) {
+
+        int ret = NO_ERROR;
+
+        memset(&videoIn->buf, 0, sizeof(videoIn->buf));
+        videoIn->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        videoIn->buf.memory = V4L2_MEMORY_USERPTR;
+        ret = ::ioctl(device_fd , VIDIOC_DQBUF, &videoIn->buf);
+        if (ret < 0) {
+            ALOGE("%s: VIDIOC_DQBUF failed,err: %s",__FUNCTION__,strerror(errno));
+            return NULL;
+        }
+
+        bool findPtr = false;
+        for (int i=0; i< preview_buffer.nr; ++i) {
+            if ((unsigned int)videoIn->buf.m.userptr == (unsigned int)mPreviewBuffer[i]) {
+                findPtr = true;
+                mCurrentFrameIndex = i;
+                break;
+            }
+        }
+        if (!findPtr) {
+            ALOGE("buf length: %d, buf start 0x%lx, buf index: %d",videoIn->buf.length,
+                  videoIn->buf.m.userptr, videoIn->buf.index);
+            ALOGE("VIDIOC_DQBUF error, not find ptr");
+            return NULL;
+        }
+
+        CameraYUVMeta* yuvMeta = &preview_buffer.yuvMeta[0];
+        memset(yuvMeta, 0, sizeof(CameraYUVMeta));
+        yuvMeta->index = mCurrentFrameIndex;
+        yuvMeta->count = 1;
+        yuvMeta->width = mAllocWidth;
+        yuvMeta->height = mAllocHeight;
+        yuvMeta->yAddr = (uint32_t)videoIn->buf.m.userptr;
+        yuvMeta->yPhy = 0;
+        yuvMeta->uPhy = 0;
+        yuvMeta->vPhy = 0;
+        if(mpreviewFormatHal == PIXEL_FORMAT_YUV422I) {
+            yuvMeta->format = HAL_PIXEL_FORMAT_YCbCr_422_I;
+            yuvMeta->yStride = mAllocWidth << 1;
+            yuvMeta->uStride = yuvMeta->yStride;
+            yuvMeta->vStride = yuvMeta->yStride;
+
+            yuvMeta->uAddr = yuvMeta->yAddr;
+            yuvMeta->vAddr = yuvMeta->yAddr;
+        } else if(mpreviewFormatHal == PIXEL_FORMAT_JZ_YUV420T) {
+            yuvMeta->format = HAL_PIXEL_FORMAT_JZ_YUV_420_B;
+            yuvMeta->yStride = mAllocWidth << 4;
+            yuvMeta->uStride = yuvMeta->yStride >> 1;
+            yuvMeta->vStride = yuvMeta->uStride;
+
+            yuvMeta->uAddr = yuvMeta->yAddr +
+                (mAllocWidth*mAllocHeight) * 12 / 8;
+            yuvMeta->vAddr = yuvMeta->uAddr;
+        }
+
+        ret = ::ioctl(device_fd, VIDIOC_QBUF, &videoIn->buf);
+        if (ret < 0) {
+            ALOGE("%s : VIDIOC_QBUF failed,err: %s",__FUNCTION__,strerror(errno));
+        }
+        return (void*)yuvMeta;
+    }
+
+    void* CameraV4L2Device::getMmapCurrentFrame(void) {
+        int ret  = NO_ERROR;
+
+        memset(&videoIn->buf, 0, sizeof(videoIn->buf));
+        videoIn->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        videoIn->buf.memory = V4L2_MEMORY_MMAP;
+        ret = ::ioctl(device_fd , VIDIOC_DQBUF, &videoIn->buf);
+        if (ret < 0) {
+            ALOGE("%s: VIDIOC_DQBUF failed,err: %s",__FUNCTION__,strerror(errno));
+            return NULL;
+        }
+        if ((int)videoIn->buf.index > videoIn->mem_num) {
+            ALOGE("%s: get mmap error: %s index > mem_num", __FUNCTION__, strerror(errno));
+            return NULL;
+        }
+
+        mCurrentFrameIndex = videoIn->buf.index;
+
+        CameraYUVMeta* yuvMeta = &preview_buffer.yuvMeta[0];
+        memset(yuvMeta, 0, sizeof(CameraYUVMeta));
+        yuvMeta->index = mCurrentFrameIndex;
+        yuvMeta->count = 1;
+        yuvMeta->width = mAllocWidth;
+        yuvMeta->height = mAllocHeight;
+        yuvMeta->yAddr = (uint32_t)videoIn->mem[mCurrentFrameIndex];
+        yuvMeta->yPhy = 0;
+        yuvMeta->uPhy = 0;
+        yuvMeta->vPhy = 0;
+        if(mpreviewFormatHal == PIXEL_FORMAT_YUV422I) {
+            yuvMeta->format = HAL_PIXEL_FORMAT_YCbCr_422_I;
+            yuvMeta->yStride = mAllocWidth << 1;
+            yuvMeta->uStride = yuvMeta->yStride;
+            yuvMeta->vStride = yuvMeta->yStride;
+
+            yuvMeta->uAddr = yuvMeta->yAddr;
+            yuvMeta->vAddr = yuvMeta->yAddr;
+        } else {
+            ALOGE("%s: error format: %d",__FUNCTION__, mpreviewFormatHal);
+            return NULL;
+        }
+
+        if (-1 == ::ioctl (device_fd, VIDIOC_QBUF, &videoIn->buf)) {
+            ALOGE("%s: qbuf error: %s",__FUNCTION__, strerror(errno));
+        }
+        return (void*)yuvMeta;
+    }
+
+    int CameraV4L2Device::getPreviewFrameSize(void)
+    {
+        return mPreviewFrameSize;
+    }
+
+    int CameraV4L2Device::getCaptureFrameSize(void)
+    {
+        return mPreviewFrameSize;
+    }
+
+    void CameraV4L2Device::getPreviewSize(int* w, int* h) {
+        *w = mPreviewWidth;
+        *h = mPreviewHeight;
+    }
+
+    void CameraV4L2Device::flushCache(void* buffer,int buffer_size) {
+
+        uint32_t addr = 0;
+        int size = 0;
+        int flag = 1;
+
+        if ((buffer == NULL) && (preview_buffer.yuvMeta[0].yAddr > 0)) {
+            addr = preview_buffer.yuvMeta[0].yAddr;
+            size = preview_buffer.size * preview_buffer.nr;
+        } else {
+            addr = (uint32_t)buffer;
+            size = buffer_size;
+        }
+        cacheflush((long int)addr, (long int)((unsigned int)addr+size), flag);
+    }
+
+    int CameraV4L2Device::getNextFrame(void)
+    {
+        usleep(1000000L/m_BestPreviewFmt.getFps());
+        return NO_ERROR;
+    }
+
+    unsigned int CameraV4L2Device::getPreviewFrameIndex(void)
+    {
+        ALOGV("Enter %s",__FUNCTION__);
+        return mCurrentFrameIndex;
+    }
+
+    camera_memory_t* CameraV4L2Device::getPreviewBufferHandle(void)
+    {
+        ALOGV("Enter %s",__FUNCTION__);
+        switch (io) {
+        case IO_METHOD_READ:
+            return videoIn->read_write_buffers;
+            break;
+        case IO_METHOD_USERPTR:
+            return preview_buffer.common;
+            break;
+        case IO_METHOD_MMAP:
+            uint8_t* ptr = (uint8_t*)mMmapPreviewBufferHandle->data
+                + (videoIn->mem_length[mCurrentFrameIndex] * mCurrentFrameIndex);
+            memcpy(ptr,
+                   videoIn->mem[mCurrentFrameIndex],
+                   videoIn->mem_length[mCurrentFrameIndex]);
+            return mMmapPreviewBufferHandle;
+            break;
+        }
+        ALOGE("%s: io %d not support",__FUNCTION__, io);
+        return NULL;
+    }
+
+    camera_memory_t* CameraV4L2Device::getCaptureBufferHandle(void)
+    {
+        ALOGV("Enter %s",__FUNCTION__);
+        return getPreviewBufferHandle();
+    }
+
+    int CameraV4L2Device::getFrameOffset(void)
+    {
+        int offset = 0;
+        if (preview_buffer.common != NULL) {
+            offset = mCurrentFrameIndex * preview_buffer.size;
+        }
+        return offset;
+    }
+
+    int CameraV4L2Device::setCommonMode(CommonMode mode_type, unsigned short mode_value)
+    {
+        status_t res = NO_ERROR;
+        const char* control_name = NULL;
+        const mode_map_t *table = NULL;
+        int table_len = 0;
+
+        switch(mode_type)
+            {
+            case WHITE_BALANCE:
+                ALOGV("set white balance mode");
+                control_name = CameraParameters::KEY_WHITE_BALANCE;
+                table = JZCameraParameters::wb_map;
+                table_len = JZCameraParameters::num_wb;
+                return set_menu_ctrl(control_name, table, table_len, mode_value);
+                break;
+            case EFFECT_MODE:
+                ALOGV("set effect mode");
+                control_name = CameraParameters::KEY_EFFECT;
+                table = JZCameraParameters::effect_map;
+                table_len = JZCameraParameters::num_eb;
+                return set_menu_ctrl(control_name, table, table_len, mode_value);
+                break;
+            case FOCUS_MODE:
+                ALOGV("set focus mode");
+                control_name = CameraParameters::KEY_FOCUS_MODE;
+                table = JZCameraParameters::focus_map;
+                table_len = JZCameraParameters::num_fb;
+                return set_menu_ctrl(control_name, table, table_len, mode_value);
+                break;
+            case FLASH_MODE:
+                ALOGV("set flash mode");
+                control_name = CameraParameters::KEY_FLASH_MODE;
+                table = JZCameraParameters::flash_map;
+                table_len = JZCameraParameters::num_flb;
+                return set_menu_ctrl(control_name, table, table_len, mode_value);
+                break;
+            case SCENE_MODE:
+                ALOGV("set scene mode");
+                control_name = CameraParameters::KEY_SCENE_MODE;
+                table = JZCameraParameters::scene_map;
+                table_len = JZCameraParameters::num_sb;
+                return set_menu_ctrl(control_name, table, table_len, mode_value);
+                break;
+            case ANTIBAND_MODE:
+                ALOGV("set antiband mode");
+                control_name = CameraParameters::KEY_ANTIBANDING;
+                table = JZCameraParameters::antibanding_map;
+                table_len = JZCameraParameters::num_ab;
+                return set_menu_ctrl(control_name, table, table_len, mode_value);
+                break;
+            case FLIP_HORIZONTALLY:
+                {
+                    ALOGV("set flip horizontally");
+                    Control * control = find_control("Flip Horizontally",V4L2_CID_HFLIP);
+                    if (control != NULL) {
+                        res = set_boolean_ctrl(&control->control);
                     }
-                    break;
-
-               case V4L2_PIX_FMT_YVYU:
-                    if (ccc) {
-                         ccc->yvyu_to_yuyv((uint8_t*)frameBuffer, strideOut,
-                                           src, videoIn->format.fmt.pix.bytesperline, 
-										   videoIn->outWidth, videoIn->outHeight);
+                    return res;
+                }
+                break;
+            case FLIP_VERTICALLY:
+                {
+                    ALOGV("set flip vertically");
+                    Control * control = find_control("Flip Vertically",V4L2_CID_VFLIP);
+                    if (control != NULL) {
+                        res = set_boolean_ctrl(&control->control);
                     }
-                    break;
-
-               case V4L2_PIX_FMT_YYUV:
-                    if (ccc) {
-                         ccc->yyuv_to_yuyv((uint8_t*)frameBuffer, strideOut,
-                                           src, videoIn->format.fmt.pix.bytesperline, 
-										   videoIn->outWidth, videoIn->outHeight);
+                    return res;
+                }
+                break;
+            case BRIGHTNESS_UP:
+                {
+                    ALOGV("set brightness up");
+                    Control * control = find_control(NULL,V4L2_CID_BRIGHTNESS);
+                    if (control != NULL) {
+                        res = set_integer_ctrl_up(&control->control);
                     }
-                    break;
-
-               case V4L2_PIX_FMT_YUV420:
-                    if (ccc)
-                         ccc->yuv420_to_yuyv((uint8_t*)frameBuffer, strideOut, src, 
-											 videoIn->outWidth, videoIn->outHeight);
-					
-                    break;
-
-               case V4L2_PIX_FMT_YVU420:
-                    if (ccc)
-                         ccc->yvu420_to_yuyv((uint8_t*)frameBuffer, strideOut, 
-											 src, videoIn->outWidth, videoIn->outHeight);
-                    break;
-
-               case V4L2_PIX_FMT_NV12:
-                    if (ccc)
-                         ccc->nv12_to_yuyv((uint8_t*)frameBuffer, strideOut, 
-										   src, videoIn->outWidth, videoIn->outHeight);
-                    break;
-
-               case V4L2_PIX_FMT_NV21:
-                    if (ccc)
-                         ccc->nv21_to_yuyv((uint8_t*)frameBuffer, strideOut, src, 
-										   videoIn->outWidth, videoIn->outHeight);
-                    break;
-
-               case V4L2_PIX_FMT_NV16:
-                    if (ccc)
-                         ccc->nv16_to_yuyv((uint8_t*)frameBuffer, strideOut, src, 
-										   videoIn->outWidth, videoIn->outHeight);
-                    break;
-
-               case V4L2_PIX_FMT_NV61:
-                    if (ccc)
-                         ccc->nv61_to_yuyv((uint8_t*)frameBuffer, strideOut, src, 
-										   videoIn->outWidth, videoIn->outHeight);
-                    break;
-
-               case V4L2_PIX_FMT_Y41P:
-                    if (ccc)
-                         ccc->y41p_to_yuyv((uint8_t*)frameBuffer, strideOut, src, 
-										   videoIn->outWidth, videoIn->outHeight);
-                    break;
-
-               case V4L2_PIX_FMT_GREY:
-                    if (ccc)
-                         ccc->grey_to_yuyv((uint8_t*)frameBuffer, strideOut,
-                                           src, videoIn->format.fmt.pix.bytesperline, 
-										   videoIn->outWidth, videoIn->outHeight);
-                    break;
-
-               case V4L2_PIX_FMT_Y16:
-                    if (ccc)
-                         ccc->y16_to_yuyv((uint8_t*)frameBuffer, strideOut,
-                                          src, videoIn->format.fmt.pix.bytesperline, 
-										  videoIn->outWidth, videoIn->outHeight);
-                    break;
-
-               case V4L2_PIX_FMT_YUYV:
-               {
-                    int h;
-                    uint8_t* pdst = (uint8_t*)frameBuffer;
-                    uint8_t* psrc = src;
-                    int ss = videoIn->outWidth << 1;
-                    for (h = 0; h < videoIn->outHeight; h++) {
-                         memcpy(pdst, psrc, ss);
-                         pdst += strideOut;
-                         psrc += videoIn->format.fmt.pix.bytesperline;
+                    return res;
+                }
+                break;
+            case BRIGHTNESS_DOWN:
+                {
+                    ALOGV("set brightness up");
+                    Control * control = find_control(NULL,V4L2_CID_BRIGHTNESS);
+                    if (control != NULL) {
+                        res = set_integer_ctrl_down(&control->control);
                     }
-               }
-               break;
+                    return res;
+                }
+                break;
+            default:
+                ALOGE("don't support %x mode type to set",mode_type);
+                return BAD_VALUE;
+                break;
+            }
+        return NO_ERROR;
+    }
 
+    Control* CameraV4L2Device::find_control(const char* ctrl_name, int ctrl_id) {
 
-               case V4L2_PIX_FMT_RGB24:
-                    if (ccc)
-                         ccc->rgb_to_yuyv((uint8_t*) frameBuffer, strideOut,
-                                          src, videoIn->format.fmt.pix.bytesperline, 
-										  videoIn->outWidth, videoIn->outHeight);
+        struct VidState* s = &(this->s);
+        if (s->control_list == NULL) {
+            ALOGE("init default control list error");
+            return NULL;
+        }
+
+        Control *current_control = s->control_list;
+        if (ctrl_id != -1) {
+            for (int i=0; i<s->num_controls; ++i) {
+                if ((int)current_control->control.id == ctrl_id) {
+                    return current_control;
+                }
+                current_control = current_control->next;
+            }
+        } else if ((ctrl_name != NULL)
+                   && (strlen(ctrl_name) > 0)) {
+            for (int i=0; i<s->num_controls; ++i) {
+                if (strcmp(ctrl_name, (const char*)current_control->control.name) == 0) {
+                    return current_control;
+                }
+                current_control = current_control->next;
+            }
+        }
+        ALOGE("%s: find ctrl: %s, id: %d error",__FUNCTION__, ctrl_name, ctrl_id);
+        return NULL;
+    }
+
+    int CameraV4L2Device::find_menu(Control *control,const char* menu_name, int* value) {
+
+        if ((control->control.type != V4L2_CTRL_TYPE_MENU)
+            || (control->menu == NULL)) {
+            ALOGE("%s: is not menu %s",__FUNCTION__,menu_name);
+            return BAD_VALUE;
+        }
+
+        for (int i=0;
+             strlen((const char*)control->menu[i].name) > 0;
+             ++i) {
+            if (strcmp(menu_name, (const char*)control->menu[i].name) == 0) {
+                *value = control->menu[i].index;
+                ALOGV("set menu name: %s, index: %d",
+                      (const char*)control->menu[i].name,*value);
+                return NO_ERROR;
+            }
+        }
+        ALOGE("%s: menu name %s not find",__FUNCTION__, menu_name);
+        return BAD_VALUE;
+    }
+
+    int CameraV4L2Device::set_menu_ctrl(const char* ctrl_name, const mode_map_t table[],
+                                    int table_len, unsigned short mode_value) {
+
+        int res = BAD_VALUE;
+        const char* menu_name = NULL;
+        struct v4l2_control control;
+        Control * current_control = NULL;
+        memset (&control, 0, sizeof (control));
+
+        /* find mode menu name */
+        for (int i=0; i<table_len; ++i) {
+            if (table[i].mode == mode_value) {
+                res = NO_ERROR;
+                menu_name = table[i].dsc;
+                break;
+            }
+        }
+
+        if (res != NO_ERROR) {
+            ALOGE("invalid %d value",mode_value);
+            return res;
+        }
+
+#ifdef DEBUG_FLIP
+        if (strcmp(menu_name, CameraParameters::WHITE_BALANCE_INCANDESCENT) == 0) {
+            Control * control = find_control("Flip Horizontally", V4L2_CID_HFLIP);
+            if (control != NULL) {
+                res = set_boolean_ctrl(&control->control);
+            }
+            return res;
+        }
+
+        if (strcmp(menu_name, CameraParameters::WHITE_BALANCE_DAYLIGHT) == 0) {
+            Control * control = find_control("Flip Vertically", V4L2_CID_VFLIP);
+            if (control != NULL) {
+                res = set_boolean_ctrl(&control->control);
+            }
+            return res;
+        }
+#endif
+
+        current_control = find_control(ctrl_name, -1);
+        if (current_control != NULL) {
+            control.id = current_control->control.id;
+            res = find_menu(current_control,menu_name,&control.value);
+        }
+
+        if (res != NO_ERROR) {
+            ALOGE("invalid menu name: %s value",menu_name);
+            return res;
+        }
+
+        ALOGV( "%s: id: %d, ctrl name: %s, menu name: %s, mode value: %d, value: %d",
+               __FUNCTION__,control.id, ctrl_name, menu_name, mode_value,control.value);
+        if ((device_fd > 0) && (-1 == ioctl (device_fd, VIDIOC_S_CTRL, &control))) {
+            ALOGE("%s: device fd: %d, set %d id, mode value: %d, value: %d error: %s",__FUNCTION__,
+                  device_fd,control.id, mode_value,control.value, strerror(errno));
+            return BAD_VALUE;
+        }
+        return NO_ERROR;
+    }
+
+    int CameraV4L2Device::set_boolean_ctrl(struct v4l2_queryctrl *queryctrl) {
+
+        int res = NO_ERROR;
+        if (queryctrl->type != V4L2_CTRL_TYPE_BOOLEAN) {
+            ALOGE("%s: is not boolean ctrl",__FUNCTION__);
+            return BAD_VALUE;
+        }
+
+        struct v4l2_control control_s;
+        memset(&control_s, 0, sizeof(struct v4l2_control));
+        control_s.id = queryctrl->id;
+        if ((res = ::ioctl(device_fd,VIDIOC_G_CTRL, &control_s)) < 0) {
+            ALOGE("%s: get id %d error: %s",
+                  __FUNCTION__, control_s.id, strerror(errno));
+            return BAD_VALUE;
+        }
+        control_s.value = !control_s.value;
+        if ((res = ::ioctl(device_fd, VIDIOC_S_CTRL, &control_s)) < 0) {
+            ALOGE("%s: set id %d error: %s",__FUNCTION__,
+                  control_s.id, strerror(errno));
+            return BAD_VALUE;
+        }
+        return NO_ERROR;
+    }
+
+    int CameraV4L2Device::set_integer_ctrl_down(struct v4l2_queryctrl *queryctrl) {
+
+        int res = NO_ERROR;
+        if (queryctrl->type != V4L2_CTRL_TYPE_INTEGER) {
+            ALOGE("%s: is not integer ctrl",__FUNCTION__);
+            return BAD_VALUE;
+        }
+        struct v4l2_control control_s;
+        memset(&control_s, 0, sizeof(struct v4l2_control));
+        control_s.id = queryctrl->id;
+        if ((res = ::ioctl(device_fd,VIDIOC_G_CTRL, &control_s)) < 0) {
+            ALOGE("%s: get id %d error: %s",
+                  __FUNCTION__, control_s.id, strerror(errno));
+            return BAD_VALUE;
+        }
+        control_s.value -= queryctrl->step;
+        if (control_s.value >= queryctrl->minimum) {
+            if ((res = ::ioctl(device_fd, VIDIOC_S_CTRL, &control_s)) < 0) {
+                ALOGE("%s: set id %d error: %s",__FUNCTION__,
+                      control_s.id, strerror(errno));
+                return BAD_VALUE;
+            }
+        } else {
+            ALOGE("%s: value %d out of range [%d,%d]",__FUNCTION__,
+                  control_s.value, queryctrl->minimum,
+                  queryctrl->maximum);
+            return BAD_VALUE;
+        }
+        return NO_ERROR;
+    }
+
+    int CameraV4L2Device::set_integer_ctrl_up(struct v4l2_queryctrl *queryctrl) {
+
+        int res = NO_ERROR;
+        if (queryctrl->type != V4L2_CTRL_TYPE_INTEGER) {
+            ALOGE("%s: is not integer ctrl",__FUNCTION__);
+            return BAD_VALUE;
+        }
+        struct v4l2_control control_s;
+        memset(&control_s, 0, sizeof(struct v4l2_control));
+        control_s.id = queryctrl->id;
+        if ((res = ::ioctl(device_fd,VIDIOC_G_CTRL, &control_s)) < 0) {
+            ALOGE("%s: get id %d error: %s",
+                  __FUNCTION__, control_s.id, strerror(errno));
+            return BAD_VALUE;
+        }
+        control_s.value += queryctrl->step;
+        if (control_s.value <= queryctrl->maximum) {
+            if ((res = ::ioctl(device_fd, VIDIOC_S_CTRL, &control_s)) < 0) {
+                ALOGE("%s: set id %d error: %s",__FUNCTION__,
+                      control_s.id, strerror(errno));
+                return BAD_VALUE;
+            }
+        } else {
+            ALOGE("%s: value %d out of range [%d,%d]",__FUNCTION__,
+                  control_s.value, queryctrl->minimum,
+                  queryctrl->maximum);
+            return BAD_VALUE;
+        }
+        return NO_ERROR;
+    }
+
+    int CameraV4L2Device::getFormat(int format)
+    {
+        int tmp_format = HAL_PIXEL_FORMAT_YCbCr_422_I;
+        switch(format)
+            {
+            case V4L2_PIX_FMT_YUYV:
+                tmp_format = HAL_PIXEL_FORMAT_YCbCr_422_I;
+                break;
+            case V4L2_PIX_FMT_NV21:
+                tmp_format = HAL_PIXEL_FORMAT_YCrCb_420_SP;
+                break;
+            case V4L2_PIX_FMT_NV16:
+                tmp_format = HAL_PIXEL_FORMAT_YCbCr_422_SP;
+                break;
+            case V4L2_PIX_FMT_RGB565:
+                tmp_format = HAL_PIXEL_FORMAT_RGB_565;
+                break;
+            case V4L2_PIX_FMT_RGB24:
+                tmp_format = HAL_PIXEL_FORMAT_RGB_888;
+                break;
+            case V4L2_PIX_FMT_RGB32:
+                tmp_format = HAL_PIXEL_FORMAT_RGBA_8888;
+                break;
+            }
+        return tmp_format;
+    }
+
+    bool CameraV4L2Device::getSupportPreviewDataCapture(void) {
+        return isSupportHighResuPre;
+    }
+
+    bool CameraV4L2Device::getSupportCaptureIncrease(void){
+        return true;
+    }
+
+    int CameraV4L2Device::getPreviewFormat(void)
+    {
+        return getFormat(mpreviewFormatHal);
+    }
+
+    int CameraV4L2Device::getCaptureFormat(void)
+    {
+        return getFormat(mpreviewFormatHal);
+    }
+
+    int CameraV4L2Device::init_param(int width, int height, int fps)
+    {
+        status_t res = NO_ERROR;
+
+        ALOGV("device: %s size: %dx%d, fps: %d",
+              device_name, width, height, fps);
+        /* Set the format */
+        memset(&videoIn->format,0,sizeof(videoIn->format));
+        videoIn->format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        videoIn->format.fmt.pix.width = width;
+        videoIn->format.fmt.pix.height = height;
+        videoIn->format.fmt.pix.pixelformat = mpreviewFormatV4l;
+        videoIn->format.fmt.pix.field = V4L2_FIELD_ANY;
+        res = ioctl(device_fd, VIDIOC_S_FMT, &videoIn->format);
+        if (res < 0) {
+            ALOGE("Open: VIDIOC_S_FMT Failed: %s", strerror(errno));
+            return res;
+        }
+
+        /* Query for the effective video format used */
+        memset(&videoIn->format,0,sizeof(videoIn->format));
+        videoIn->format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        res = ioctl(device_fd, VIDIOC_G_FMT, &videoIn->format);
+        if (res < 0) {
+            ALOGE("Open: VIDIOC_G_FMT Failed: %s", strerror(errno));
+            return res;
+        }
+
+        unsigned int min = videoIn->format.fmt.pix.width * 2;
+        if (videoIn->format.fmt.pix.bytesperline < min)
+            videoIn->format.fmt.pix.bytesperline = min;
+        min = videoIn->format.fmt.pix.bytesperline
+             * videoIn->format.fmt.pix.height;
+        if (videoIn->format.fmt.pix.sizeimage < min)
+            videoIn->format.fmt.pix.sizeimage = min;
+
+        /* Store the pixel formats we will use */
+        videoIn->outWidth           = width;
+        videoIn->outHeight          = height;
+        // Calculate the expected output framesize in YUYV
+        videoIn->outFrameSize       = width * height << 1;
+        videoIn->capBytesPerPixel   = 2;
+
+        ALOGV("Actual format: (%d x %d), Fps: %d,"
+              "pixfmt: '%c%c%c%c', bytesperline: %d",
+              videoIn->format.fmt.pix.width,
+              videoIn->format.fmt.pix.height,
+              videoIn->params.parm.capture.timeperframe.denominator,
+              videoIn->format.fmt.pix.pixelformat & 0xFF,
+              (videoIn->format.fmt.pix.pixelformat >> 8) & 0xFF,
+              (videoIn->format.fmt.pix.pixelformat >> 16) & 0xFF,
+              (videoIn->format.fmt.pix.pixelformat >> 24) & 0xFF,
+              videoIn->format.fmt.pix.bytesperline);
+        return res;
+    }
+
+    void CameraV4L2Device::setCameraFormat(int format) {
+
+        switch (io) {
+        case IO_METHOD_READ:
+        case IO_METHOD_MMAP:
+            setMmapFormat(format);
+            break;
+        case IO_METHOD_USERPTR:
+            setUserPtrFormat(format);
+            break;
+        }
+    }
+
+    void CameraV4L2Device::setMmapFormat(int format) {
+        ALOGV("Enter %s",__FUNCTION__);
+
+        if (format != PIXEL_FORMAT_YUV422I) {
+            ALOGE("%s: don't supprt format: 0x%x",__FUNCTION__, format);
+        }
+        mpreviewFormatHal = PIXEL_FORMAT_YUV422I;
+        mpreviewFormatV4l = V4L2_PIX_FMT_YUYV;
+    }
+
+    void CameraV4L2Device::setUserPtrFormat(int format) {
+        ALOGV("Enter %s format: %x",__FUNCTION__,format);
+        if (mpreviewFormatHal != format) {
+            mpreviewFormatHal = format;
+        }
+        if(mpreviewFormatHal == PIXEL_FORMAT_YUV422I) {
+            mpreviewFormatV4l = V4L2_PIX_FMT_YUYV;
+        } else if(mpreviewFormatHal == PIXEL_FORMAT_JZ_YUV420T) {
+            mpreviewFormatV4l = V4L2_PIX_FMT_YUYV;
+#ifdef V4L2_PIX_FMT_JZ420B
+            mpreviewFormatV4l = V4L2_PIX_FMT_JZ420B;
+#endif
+        }
+        return;
+    }
+
+    int CameraV4L2Device::setCameraParam(struct camera_param& params, int fps)
+    {
+        status_t res = NO_ERROR;
+        int width, height;
+
+        width = params.param.ptable[0].w;
+        height = params.param.ptable[0].h;
+        mPreviewWidth = width;
+        mPreviewHeight = height;
+        mPreviewFps = fps;
+
+        ALOGV("%s: size: %dx%d",__FUNCTION__, mPreviewWidth, mPreviewHeight);
+        return res;
+    }
+
+    void CameraV4L2Device::init_modes(int *mode,struct v4l2_querymenu *querymenu,
+                                     const mode_map_t table[], int table_len) {
+        if (table_len == 0) {
+            ALOGE("%s: table len is 0",__FUNCTION__);
+            return;
+        }
+
+        for (int i=0;
+             strlen ((const char*)querymenu[i].name)>0;
+             ++i) {
+            for (int j=0; j<table_len; ++j) {
+                if (strcmp((const char*)querymenu[i].name,
+                           table[j].dsc) == 0) {
+                    *mode |= table[j].mode;
                     break;
+                }
+            }
+        }
+    }
 
-                    
-               case V4L2_PIX_FMT_BGR24:
-                    if (ccc)
-                         ccc->bgr_to_yuyv((uint8_t*) frameBuffer, strideOut,
-                                          src, videoIn->format.fmt.pix.bytesperline, 
-										  videoIn->outWidth, videoIn->outHeight);
+    void CameraV4L2Device::do_menu(struct v4l2_queryctrl &queryctrl,
+                struct v4l2_querymenu *querymenu,
+                struct sensor_info* s_info) {
+
+        const char* ctl_name = (const char*) queryctrl.name;
+        const mode_map_t *table = NULL;
+        int table_len = 0;
+        int *mode = NULL;
+
+        if (querymenu == NULL
+            || !(strlen(ctl_name) > 0)) {
+            ALOGE("query menu is null");
+            return;
+        }
+
+        if (strcmp (CameraParameters::KEY_WHITE_BALANCE,ctl_name) == 0) {
+            s_info->modes.balance = 0;
+            table_len = JZCameraParameters::num_wb;
+            table = JZCameraParameters::wb_map;
+            mode = (int*)&s_info->modes.balance;
+        } else if (strcmp (CameraParameters::KEY_EFFECT,ctl_name) == 0) {
+            s_info->modes.effect = 0;
+            table_len = JZCameraParameters::num_eb;
+            table = JZCameraParameters::effect_map;
+            mode = (int*)&s_info->modes.effect;
+        } else if (strcmp (CameraParameters::KEY_ANTIBANDING,ctl_name) == 0) {
+            s_info->modes.antibanding = 0;
+            table_len = JZCameraParameters::num_ab;
+            table = JZCameraParameters::antibanding_map;
+            mode = (int*)&s_info->modes.antibanding;
+        } else if (strcmp (CameraParameters::KEY_SCENE_MODE, ctl_name) == 0) {
+            s_info->modes.scene_mode = 0;
+            table_len = JZCameraParameters::num_sb;
+            table = JZCameraParameters::scene_map;
+            mode = (int*)&s_info->modes.scene_mode;
+        } else if (strcmp (CameraParameters::KEY_FLASH_MODE, ctl_name) == 0) {
+            s_info->modes.flash_mode = 0;
+            table_len = JZCameraParameters::num_flb;
+            table = JZCameraParameters::flash_map;
+            mode = (int*)&s_info->modes.flash_mode;
+        } else if (strcmp (CameraParameters::KEY_FOCUS_MODE, ctl_name) == 0) {
+            s_info->modes.focus_mode = 0;
+            table_len = JZCameraParameters::num_fb;
+            table = JZCameraParameters::focus_map;
+            mode = (int*)&s_info->modes.focus_mode;
+        } else {
+            ALOGE("query ctrl name: %s not support", ctl_name);
+            return;
+        }
+        init_modes(mode,querymenu,table,table_len);
+        return;
+    }
+
+    void CameraV4L2Device::initModeValues(struct sensor_info* s_info)
+    {
+        struct VidState* s = &(this->s);
+
+        if (s->control_list == NULL) {
+            ALOGE("init default control list error");
+            return;
+        }
+
+        Control *current_control = s->control_list;
+
+        for (int i=0; i<s->num_controls; ++i) {
+            switch (current_control->control.type) {
+            case V4L2_CTRL_TYPE_INTEGER:
+                ALOGV("type: integer, id: %x, name: %s, min: %d, max: %d, step: %d,"
+                      "default value: %d, flag: %d",current_control->control.id,
+                      current_control->control.name,current_control->control.minimum,
+                      current_control->control.maximum,current_control->control.step,
+                      current_control->control.default_value,current_control->control.flags);
+                break;
+            case V4L2_CTRL_TYPE_BOOLEAN:
+                ALOGV("type: boolean, id: %x, name: %s, default value: %d, flag: %d",
+                      current_control->control.id,current_control->control.name,
+                      current_control->control.default_value,current_control->control.flags);
+                break;
+            case V4L2_CTRL_TYPE_MENU:
+                ALOGV("type: menu, id: %x, name: %s, default value: %d, flag: %d",
+                      current_control->control.id,current_control->control.name,
+                      current_control->control.default_value,current_control->control.flags);
+                do_menu(current_control->control,current_control->menu,s_info);
+                break;
+            case V4L2_CTRL_TYPE_BUTTON:
+                ALOGV("type: button, id: %x, name: %s, default value: %d, flag: %d",
+                      current_control->control.id,current_control->control.name,
+                      current_control->control.default_value,current_control->control.flags);
+                break;
+            case V4L2_CTRL_TYPE_STRING:
+                ALOGV("type: string, id: %x, name: %s, default value: %d, flag: %d",
+                      current_control->control.id,current_control->control.name,
+                      current_control->control.default_value,current_control->control.flags);
+                break;
+            case V4L2_CTRL_TYPE_INTEGER64:
+                ALOGV("type: integer64, id: %x, name: %s, default value: %d, flag: %d",
+                      current_control->control.id,current_control->control.name,
+                      current_control->control.default_value,current_control->control.flags);
+                break;
+            case V4L2_CTRL_TYPE_CTRL_CLASS:
+                ALOGV("type: ctrl class, id: %x, name: %s, default value: %d, flag: %d",
+                      current_control->control.id,current_control->control.name,
+                      current_control->control.default_value,current_control->control.flags);
+                break;
+            case V4L2_CTRL_TYPE_BITMASK:
+                ALOGV("type: bitmask, id: %x, name: %s, default value: %d, flag: %d",
+                      current_control->control.id,current_control->control.name,
+                      current_control->control.default_value,current_control->control.flags);
+                break;
+            }
+            current_control = current_control->next;
+        }
+    }
+
+    void CameraV4L2Device::getSensorInfo(struct sensor_info* s_info,struct resolution_info* r_info )
+    {
+        status_t res = NO_ERROR;
+        int flag = 0;
+
+        ALOGV("Enter %s, state: %d",__FUNCTION__,V4L2DeviceState);
+
+        if ((V4L2DeviceState & DEVICE_CONNECTED) != DEVICE_CONNECTED) {
+            ALOGE("%s: don't connect %s",__FUNCTION__,device_name);
+            return;
+        }
+
+        struct v4l2_fmtdesc fmt;
+        memset (&fmt, 0, sizeof(struct v4l2_fmtdesc));
+        fmt.index = 0;
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+        while((res = ::ioctl(device_fd, VIDIOC_ENUM_FMT, &fmt)) == 0) {
+            fmt.index++;
+            switch(fmt.pixelformat)
+                {
+                case V4L2_PIX_FMT_NV16:
                     break;
-
-               case V4L2_PIX_FMT_SGBRG8: //0
+                case V4L2_PIX_FMT_NV21:
                     break;
-
-               case V4L2_PIX_FMT_SGRBG8: //1
-                    break;
-
-               case V4L2_PIX_FMT_SBGGR8: //2
-                    break;
-
-               case V4L2_PIX_FMT_SRGGB8: //3
-                    break;
-
-               default:
-                    ALOGE("error %s: unknow format: %i", __FUNCTION__,
-                          videoIn->format.fmt.pix.pixelformat);
-                    break;
-               }
-               ALOGE_IF(DEBUG_V4L2, "%s: copy frame to destination 0x%p", __FUNCTION__,frameBuffer);
-          }
-
-          ret = ::ioctl(device_fd, VIDIOC_QBUF, &videoIn->buf);
-          if (ret < 0) {
-               ALOGE("%s : VIDIOC_QBUF failed",__FUNCTION__);
-               return NULL;
-          }
-
-          nQueued++;
-
-          ALOGE_IF(DEBUG_V4L2, "%s: - leave Queued buffer", __FUNCTION__);
-
-		  yuvMeta.index = mCurrentFrameIndex;
-		  yuvMeta.count = 1;
-		  yuvMeta.width = (int32_t)(videoIn->outWidth);
-		  yuvMeta.height = (int32_t)(videoIn->outHeight);
-		  yuvMeta.yAddr = (uint32_t)frameBuffer;
-		  yuvMeta.vAddr = yuvMeta.yAddr;
-		  yuvMeta.uAddr = yuvMeta.yAddr;
-          yuvMeta.yPhy = 0;
-          yuvMeta.uPhy = 0;
-          yuvMeta.vPhy = 0;
-		  yuvMeta.yStride = strideOut;
-		  yuvMeta.uStride = yuvMeta.yStride;
-		  yuvMeta.vStride = yuvMeta.yStride;
-		  yuvMeta.format = HAL_PIXEL_FORMAT_YCbCr_422_I;
-
-          // return frameBuffer;
-		  return (void*)(&yuvMeta);
-     }
-
-     int CameraV4L2Device::getPreviewFrameSize(void)
-     {
-          return mPreviewFrameSize;
-     }
-
-     int CameraV4L2Device::getCaptureFrameSize(void)
-     {
-          return mCaptureFrameSize;
-     }
-
-     int CameraV4L2Device::getNextFrame(void)
-     {
-          ALOGE_IF(DEBUG_V4L2,"Enter %s : line=%d",__FUNCTION__,__LINE__);
-          usleep(1000000L/m_BestPreviewFmt.getFps());
-          return NO_ERROR;
-     }
-
-     unsigned int CameraV4L2Device::getPreviewFrameIndex(void)
-     {
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          
-          return mCurrentFrameIndex;
-     }
-
-     camera_memory_t* CameraV4L2Device::getPreviewBufferHandle(void)
-     {
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return preview_buffer.common;
-     }
-
-
-     camera_memory_t* CameraV4L2Device::getCaptureBufferHandle(void)
-     {
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return capture_buffer.common;
-     }
-
-     int CameraV4L2Device::getFrameOffset(void)
-     {
-          ALOGE_IF(DEBUG_V4L2,"Enter %s : line=%d",__FUNCTION__,__LINE__);
-          int offset = 0;
-
-          if (preview_buffer.common != NULL) {
-               offset = mCurrentFrameIndex * preview_buffer.size;
-          } else if (capture_buffer.common != NULL) {
-               offset = mCurrentFrameIndex * capture_buffer.size;
-          }
-          return offset;
-     }
-
-     int CameraV4L2Device::setCommonMode(CommonMode mode_type, unsigned short mode_value)
-     {
-          status_t res = NO_ERROR;
-
-          if (device_fd < 0)
-               return INVALID_OPERATION;
-
-          switch(mode_type)
-          {
-          case WHITE_BALANCE:
-               ALOGE_IF(DEBUG_V4L2,"set white balance mode");
-               if (mode_value == WHITE_BALANCE_AUTO)
-                    update_ctrl_flags(V4L2_CID_AUTO_WHITE_BALANCE);
-               else
-                    update_ctrl_flags(V4L2_CID_WHITE_BALANCE_TEMPERATURE,mode_value);
-               break;
-          case EFFECT_MODE:
-               ALOGE_IF(DEBUG_V4L2,"set effect mode");
-               update_ctrl_flags(V4L2_CID_HUE_AUTO,mode_value);
-               break;
-          case FOCUS_MODE:
-               ALOGE_IF(DEBUG_V4L2,"set focus mode");
-               update_ctrl_flags(V4L2_CID_FOCUS_AUTO);
-               break;
-          case FLASH_MODE:
-               ALOGE_IF(DEBUG_V4L2,"set flash mode");
-               update_ctrl_flags(V4L2_CID_EXPOSURE);
-               break;
-          case SCENE_MODE:
-               ALOGE_IF(DEBUG_V4L2,"set scene mode");
-               update_ctrl_flags(V4L2_CID_COLORFX, mode_value);
-               break;
-          case ANTIBAND_MODE:
-               ALOGE_IF(DEBUG_V4L2,"set antiband mode");
-               update_ctrl_flags(V4L2_CID_SHARPNESS,mode_value);
-               break;
-          }
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return res;
-     }
-
-     void CameraV4L2Device::update_ctrl_flags(int id, unsigned short value) {
-          ALOGE_IF(DEBUG_V4L2, "Enter %s, line=%d", __FUNCTION__,__LINE__);
-     }
-
-     int CameraV4L2Device::getFormat(int format)
-     {
-          int tmp_format = HAL_PIXEL_FORMAT_YCbCr_422_I;
-          switch(format)
-          {
-          case V4L2_PIX_FMT_YUYV:
-               break;
-          case V4L2_PIX_FMT_NV21:
-               tmp_format = HAL_PIXEL_FORMAT_YCrCb_420_SP;
-               break;
-          case V4L2_PIX_FMT_NV16:
-               tmp_format = HAL_PIXEL_FORMAT_YCbCr_422_SP;
-               break;
-          case V4L2_PIX_FMT_RGB565:
-               tmp_format = HAL_PIXEL_FORMAT_RGB_565;
-               break;
-          case V4L2_PIX_FMT_RGB24:
-               tmp_format = HAL_PIXEL_FORMAT_RGB_888;
-               break;
-          case V4L2_PIX_FMT_RGB32:
-               tmp_format = HAL_PIXEL_FORMAT_RGBA_8888;
-               break;
-          }
-          return tmp_format;
-     }
-
-     int CameraV4L2Device::getPreviewFormat(void)
-     {
-          return getFormat(V4L2_PIX_FMT_YUYV);
-     }
-
-     int CameraV4L2Device::getCaptureFormat(void)
-     {
-          return getFormat(V4L2_PIX_FMT_YUYV);
-     }
-     
-     int CameraV4L2Device::InitParam(int width, int height, int fps)
-     {
-          status_t res = NO_ERROR;
-
-          ALOGE_IF(DEBUG_V4L2,"Enter %s line = %d",__FUNCTION__, __LINE__);
-
-          static const struct {
-               int fmt;
-               int bpp;
-               int isplanar;
-               int allowcrop;
-          }pixFmtsOrder[] = {
-               {V4L2_PIX_FMT_YUYV,     2,0,1},
-               {V4L2_PIX_FMT_YVYU,     2,0,1},
-               {V4L2_PIX_FMT_UYVY,     2,0,1},
-               {V4L2_PIX_FMT_YYUV,     2,0,1},
-               {V4L2_PIX_FMT_SPCA501,  2,0,0},
-               {V4L2_PIX_FMT_SPCA505,  2,0,0},
-               {V4L2_PIX_FMT_SPCA508,  2,0,0},
-               {V4L2_PIX_FMT_YUV420,   0,1,0},
-               {V4L2_PIX_FMT_YVU420,   0,1,0},
-               {V4L2_PIX_FMT_NV12,     0,1,0},
-               {V4L2_PIX_FMT_NV21,     0,1,0},
-               {V4L2_PIX_FMT_NV16,     0,1,0},
-               {V4L2_PIX_FMT_NV61,     0,1,0},
-               {V4L2_PIX_FMT_Y41P,     0,0,0},
-               {V4L2_PIX_FMT_SGBRG8,   0,0,0},
-               {V4L2_PIX_FMT_SGRBG8,   0,0,0},
-               {V4L2_PIX_FMT_SBGGR8,   0,0,0},
-               {V4L2_PIX_FMT_SRGGB8,   0,0,0},
-               {V4L2_PIX_FMT_BGR24,    3,0,1},
-               {V4L2_PIX_FMT_RGB24,    3,0,1},
-               {V4L2_PIX_FMT_MJPEG,    0,1,0},
-               {V4L2_PIX_FMT_JPEG,     0,1,0},
-               {V4L2_PIX_FMT_GREY,     1,0,1},
-               {V4L2_PIX_FMT_Y16,      2,0,1},
-          };
-
-
-          if(m_AllFmts.isEmpty()) {
-               ALOGE("No video formats availabe");
-               return -1;
-          }
-
-          frameInterval closest;
-          unsigned int i;
-          int area = width * height;
-          int closestDArea = -1;
-          for (i = 0; i < m_AllFmts.size(); ++i) {
-               frameInterval f = m_AllFmts[i];
-
-               if (f.getWidth() >= width && f.getHeight() >= height) {
-                    closest = f;
-                    closestDArea = f.getWidth()*f.getHeight() - area;
-                    break;
-               }
-          }
-
-          if (closestDArea == -1) {
-               ALOGE("Size not available: (%dx%d)",width, height);
-               return -1;
-          }
-
-          bool crop = width != closest.getWidth() || height != closest.getHeight();
-          res = -1;
-          for (i = 0; i < sizeof(pixFmtsOrder) / sizeof(pixFmtsOrder[0]); ++i) {
-
-               if (!crop || pixFmtsOrder[i].allowcrop) {
-
-                    memset(&videoIn->format, 0 , sizeof(videoIn->format));
-                    videoIn->format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                    videoIn->format.fmt.pix.width = closest.getWidth();
-                    videoIn->format.fmt.pix.height = closest.getHeight();
-                    videoIn->format.fmt.pix.pixelformat = pixFmtsOrder[i].fmt;
-                    
-                    res = ::ioctl(device_fd, VIDIOC_TRY_FMT,&videoIn->format);
-                    if (res >= 0) {
-                         break;
-                    }
-               }
-          }
-          if (res < 0) {
-               ALOGE("Open:VIDIOC_TRY_FMT failed: (%s)", strerror(errno));
-               return res;
-          }
-
-          /* Set the format */
-          memset(&videoIn->format,0,sizeof(videoIn->format));
-          videoIn->format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-          videoIn->format.fmt.pix.width = closest.getWidth();
-          videoIn->format.fmt.pix.height = closest.getHeight();
-          videoIn->format.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;//pixFmtsOrder[i].fmt;
-          videoIn->format.fmt.pix.field = V4L2_FIELD_INTERLACED;
-          res = ioctl(device_fd, VIDIOC_S_FMT, &videoIn->format);
-          if (res < 0) {
-               ALOGE("Open: VIDIOC_S_FMT Failed: %s", strerror(errno));
-               return res;
-          }
-
-          /* Query for the effective video format used */
-          memset(&videoIn->format,0,sizeof(videoIn->format));
-          videoIn->format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-          res = ioctl(device_fd, VIDIOC_G_FMT, &videoIn->format);
-          if (res < 0) {
-               ALOGE("Open: VIDIOC_G_FMT Failed: %s", strerror(errno));
-               return res;
-          }
-
-
-          unsigned int min = videoIn->format.fmt.pix.width * 2;
-          if (videoIn->format.fmt.pix.bytesperline < min)
-               videoIn->format.fmt.pix.bytesperline = min;
-          min = videoIn->format.fmt.pix.bytesperline * videoIn->format.fmt.pix.height;
-          if (videoIn->format.fmt.pix.sizeimage < min)
-               videoIn->format.fmt.pix.sizeimage = min;
-
-          /* Store the pixel formats we will use */
-          videoIn->outWidth           = width;
-          videoIn->outHeight          = height;
-          // Calculate the expected output framesize in YUYV
-          videoIn->outFrameSize       = width * height << 1;
-          videoIn->capBytesPerPixel   = pixFmtsOrder[i].bpp;
-
-          /* sets video device frame rate */
-          memset(&videoIn->params,0,sizeof(videoIn->params));
-          videoIn->params.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-          videoIn->params.parm.capture.timeperframe.numerator = 1;
-          videoIn->params.parm.capture.timeperframe.denominator = closest.getFps();
-
-          /* Set the framerate. If it fails, it wont be fatal */
-          if (ioctl(device_fd,VIDIOC_S_PARM,&videoIn->params) < 0) {
-               ALOGE("VIDIOC_S_PARM error: Unable to set %d fps", closest.getFps());
-          }
-
-          /* Gets video device defined frame rate (not real - consider it a maximum value) */
-          if (ioctl(device_fd,VIDIOC_G_PARM,&videoIn->params) < 0) {
-               ALOGE("VIDIOC_G_PARM - Unable to get timeperframe");
-          }
-
-          ALOGE_IF(DEBUG_V4L2,"Actual format: (%d x %d), Fps: %d, pixfmt: '%c%c%c%c', bytesperline: %d",
-                   videoIn->format.fmt.pix.width,
-                   videoIn->format.fmt.pix.height,
-                   videoIn->params.parm.capture.timeperframe.denominator,
-                   videoIn->format.fmt.pix.pixelformat & 0xFF, (videoIn->format.fmt.pix.pixelformat >> 8) & 0xFF,
-                   (videoIn->format.fmt.pix.pixelformat >> 16) & 0xFF, (videoIn->format.fmt.pix.pixelformat >> 24) & 0xFF,
-                   videoIn->format.fmt.pix.bytesperline);
-          return res;
-     }
-     
-     int CameraV4L2Device::setCameraParam(struct camera_param& params, int fps)
-     {
-          status_t res = NO_ERROR;
-          int width, height;
-
-          ALOGE_IF(DEBUG_V4L2,"Enter %s line = %d",__FUNCTION__, __LINE__);
-
-         
-          if (device_fd < 0)
-               return INVALID_OPERATION;
-
-          if (params.cmd == CPCMD_SET_PREVIEW_RESOLUTION) {
-               width = params.param.ptable[0].w;
-               height = params.param.ctable[0].h;
-               res = InitParam(width, height, fps);
-          }
-
-          return res;
-     }
-
-     void CameraV4L2Device::initModeValues(struct sensor_info* s_info)
-     {
-          s_info->modes.balance = (WHITE_BALANCE_AUTO | WHITE_BALANCE_INCANDESCENT
-                                        | WHITE_BALANCE_FLUORESCENT |WHITE_BALANCE_WARM_FLUORESCENT
-                                        | WHITE_BALANCE_DAYLIGHT | WHITE_BALANCE_CLOUDY_DAYLIGHT);
-          s_info->modes.effect = (EFFECT_MONO | EFFECT_NEGATIVE | EFFECT_SOLARIZE | EFFECT_SEPIA |
-                                       EFFECT_POSTERIZE | EFFECT_WHITEBOARD);
-          s_info->modes.antibanding = (ANTIBANDING_AUTO | ANTIBANDING_50HZ | ANTIBANDING_60HZ | ANTIBANDING_OFF);
-          s_info->modes.flash_mode = (FLASH_MODE_OFF | FLASH_MODE_AUTO | FLASH_MODE_ON | FLASH_MODE_RED_EYE | FLASH_MODE_TORCH);
-          s_info->modes.scene_mode = (SCENE_MODE_AUTO |
-                                           SCENE_MODE_ACTION |
-                                           SCENE_MODE_PORTRAIT |
-                                           SCENE_MODE_LANDSCAPE |
-                                           SCENE_MODE_NIGHT |
-                                           SCENE_MODE_NIGHT_PORTRAIT |
-                                           SCENE_MODE_THEATRE |
-                                           SCENE_MODE_BEACH |
-                                           SCENE_MODE_SNOW |
-                                           SCENE_MODE_SUNSET |
-                                           SCENE_MODE_STEADYPHOTO |
-                                           SCENE_MODE_FIREWORKS |
-                                           SCENE_MODE_SPORTS |
-                                           SCENE_MODE_PARTY |
-                                           SCENE_MODE_CANDLELIGHT);
-          s_info->modes.focus_mode = ( FOCUS_MODE_FIXED |
-                                            FOCUS_MODE_AUTO |
-                                            FOCUS_MODE_INFINITY |
-                                            FOCUS_MODE_MACRO );
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-     }
-
-     void CameraV4L2Device::getSensorInfo(struct sensor_info* s_info,struct resolution_info* r_info )
-     {
-          status_t res = NO_ERROR;
-          int flag = 0;
-          struct v4l2_fmtdesc fmt;
-
-          if (device_fd < 0)
-               return;
-
-          memset (&fmt, 0, sizeof(struct v4l2_fmtdesc));
-          fmt.index = 0;
-          fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-         
-          while((res = ::ioctl(device_fd, VIDIOC_ENUM_FMT, &fmt)) == 0)
-          {
-               fmt.index++;
-               switch(fmt.pixelformat)
-               {
-               case V4L2_PIX_FMT_NV16:
-                    break;
-               case V4L2_PIX_FMT_NV21:
-                    break;
-               case V4L2_PIX_FMT_YUYV:
+                case V4L2_PIX_FMT_YUYV:
                     flag = 1;
                     break;
-               case V4L2_PIX_FMT_YUV420:
+                case V4L2_PIX_FMT_YUV420:
                     break;
-               case V4L2_PIX_FMT_JPEG:
+                case V4L2_PIX_FMT_JPEG:
                     break;
-               }
-               if (flag)
+                }
+            if (flag)
+                break;
+        }
+
+        if (flag == 0) {
+            ALOGE("%s: do not support frame format YUYV, %d (%s)",__FUNCTION__,
+                  errno, strerror(errno));
+            return;
+        }
+
+        struct v4l2_frmsizeenum fsize;
+        memset(&fsize, 0, sizeof(struct v4l2_frmsizeenum));
+        fsize.index = 0;
+        fsize.pixel_format = V4L2_PIX_FMT_YUYV;
+
+        while ((res = ::ioctl(device_fd, VIDIOC_ENUM_FRAMESIZES, &fsize)) == 0) {
+            if (fsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+                (r_info->ptable)[fsize.index].w = fsize.discrete.width;
+                (r_info->ptable)[fsize.index].h = fsize.discrete.height;
+
+                (r_info->ctable)[fsize.index].w = fsize.discrete.width;
+                (r_info->ctable)[fsize.index].h = fsize.discrete.height;
+
+            } else if (fsize.type == V4L2_FRMSIZE_TYPE_CONTINUOUS) {
+                break;
+            } else if (fsize.type == V4L2_FRMSIZE_TYPE_STEPWISE) {
+                break;
+            }
+            fsize.index++;
+            s_info->prev_resolution_nr++;
+            s_info->cap_resolution_nr++;
+        }
+        if (res != NO_ERROR && errno != EINVAL) {
+            ALOGE("%s: enum frame size error, %d => (%s)",
+                  __FUNCTION__, errno, strerror(errno));
+        }
+
+        initModeValues(s_info);
+
+        return;
+    }
+
+    int CameraV4L2Device::getResolution(struct resolution_info* info)
+    {
+        ALOGV("Enter %s",__FUNCTION__);
+
+        unsigned int count = m_AllFmts.size();
+        if (m_AllFmts.size() > 16)
+            count = 16;
+        for (unsigned i = 0; i < count; ++i) {
+            (info->ptable)[i].w = m_AllFmts[i].getWidth();
+            (info->ptable)[i].h = m_AllFmts[i].getHeight();
+        }
+        return NO_ERROR;
+    }
+
+    int CameraV4L2Device::getCurrentCameraId(void)
+    {
+        return currentId;
+    }
+
+    int CameraV4L2Device::open_device(void) {
+        struct stat st;
+        if (-1 == stat(device_name, &st)) {
+            ALOGE("Cannot identify '%s': %d, %s", device_name,
+                  errno, strerror(errno));
+            return NO_INIT;
+        }
+
+        if (!S_ISCHR(st.st_mode)) {
+            ALOGE("%s is no device", device_name);
+            return NO_INIT;
+        }
+
+        device_fd = open(device_name, O_RDWR|O_NONBLOCK);
+        if (device_fd < 0) {
+            memset(device_name,0,256);
+            currentId = -1;
+            V4L2DeviceState = DEVICE_UNINIT;
+            ALOGE("%s: can not connect %s device", __FUNCTION__,device_name);
+            return NO_INIT;
+        }
+        return NO_ERROR;
+    }
+
+    int CameraV4L2Device::init_device(void) {
+        int res = NO_ERROR;
+
+        memset(videoIn, 0, sizeof(struct vdIn));
+        res = ::ioctl(device_fd, VIDIOC_QUERYCAP, &videoIn->cap);
+        if (res != NO_ERROR) {
+            ALOGE("%s: opening device unable to query device,err: %s",__FUNCTION__,strerror(errno));
+            return NO_INIT;
+        }
+
+        ALOGV("driver: %s, card: %s, bus_info: %s"
+              "version:%d.%d.%d, capabilities: 0x%08x",
+              (const char*)(videoIn->cap.driver),
+              (const char*)(videoIn->cap.card),
+              (const char*)(videoIn->cap.bus_info),
+              videoIn->cap.version>>16, (videoIn->cap.version>>8)&0xff,
+              (videoIn->cap.version)&0xff, videoIn->cap.capabilities);
+
+        if (!(videoIn->cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+            ALOGE("%s: opening device: video capture not supported",
+                  __FUNCTION__);
+            return NO_INIT;
+        }
+
+        isSupportHighResuPre = false;
+        if (videoIn->cap.capabilities & V4L2_CAP_STREAMING) {
+            if (strcmp((const char*)videoIn->cap.card, "JZ4780-Camera") == 0) {
+                io = IO_METHOD_USERPTR;
+                if (0 == ::ioctl(device_fd, VIDIOC_DBG_G_CHIP_IDENT, &videoIn->chip_ident)) {
+                    isSupportHighResuPre = (videoIn->chip_ident.ident==1)? true : false;
+                }
+                ALOGV("support user ptr I/O");
+            } else {
+                io = IO_METHOD_MMAP;
+                isSupportHighResuPre = true;
+                ALOGV("support mmap I/O");
+            }
+        } else if (videoIn->cap.capabilities & V4L2_CAP_READWRITE) {
+            io = IO_METHOD_READ;
+            isSupportHighResuPre = true;
+            ALOGV("support read write I/O");
+        } else {
+            ALOGE("%s: not invalidy I/O",__FUNCTION__);
+            return NO_INIT;
+        }
+
+        videoIn->cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (0 == ::ioctl(device_fd, VIDIOC_CROPCAP, &videoIn->cropcap)) {
+            videoIn->crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            videoIn->crop.c = videoIn->cropcap.defrect;
+            if (-1 == ::ioctl(device_fd, VIDIOC_S_CROP, &videoIn->crop)) {
+                switch(errno) {
+                case EINVAL:
+                    //ALOGV("Cropping not supported,err: %s",strerror(errno));
                     break;
-          }
-
-          
-          if (flag == 0)
-          {
-               ALOGE("%s: do not support frame format YUYV, %d (%s)",__FUNCTION__,
-                     errno, strerror(errno));
-               return;
-          }
-
-          struct v4l2_frmsizeenum fsize;
-          memset(&fsize, 0, sizeof(struct v4l2_frmsizeenum));
-          fsize.index = 0;
-          fsize.pixel_format = V4L2_PIX_FMT_YUYV;
-
-          while ((res = ::ioctl(device_fd, VIDIOC_ENUM_FRAMESIZES, &fsize)) == 0)
-          {
-               if (fsize.type == V4L2_FRMSIZE_TYPE_DISCRETE)
-               {
-                    (r_info->ptable)[fsize.index].w = fsize.discrete.width;
-                    (r_info->ptable)[fsize.index].h = fsize.discrete.height;
-
-                    (r_info->ctable)[fsize.index].w = fsize.discrete.width;
-                    (r_info->ctable)[fsize.index].h = fsize.discrete.height;
-
-               } else if (fsize.type == V4L2_FRMSIZE_TYPE_CONTINUOUS)
-               {
+                default:
                     break;
-               } else if (fsize.type == V4L2_FRMSIZE_TYPE_STEPWISE)
-               {
-                    break;
-               }
-               fsize.index++;
-               s_info->prev_resolution_nr++;
-               s_info->cap_resolution_nr++;
-          }
-          if (res != NO_ERROR && errno != EINVAL)
-          {
-               ALOGE("%s: enum frame size error, %d => (%s)",
-                     __FUNCTION__, errno, strerror(errno));
-          }
+                }
+            }
+        }
+        return NO_ERROR;
+    }
 
-          initModeValues(s_info);
+    int CameraV4L2Device::initPmem(int format) {
 
-          return;
-     }
+        if (access(PMEMDEVICE, R_OK|W_OK) != 0) {
+            ALOGE("%s: %s device don't access,err: %s",__FUNCTION__,
+                  PMEMDEVICE, strerror(errno));
+            return BAD_VALUE;
+        }
 
-     int CameraV4L2Device::getResolution(struct resolution_info* info)
-     {
-          ALOGE_IF(DEBUG_V4L2, "Enter %s", __FUNCTION__);
+        if (pmem_device_fd < 0) {
+            pmem_device_fd = open(PMEMDEVICE, O_RDWR);
+            if (pmem_device_fd < 0) {
+                ALOGE("%s: open %s error, %s", __FUNCTION__, PMEMDEVICE, strerror(errno));
+                pmem_device_fd = -1;
+            } else {
+                struct pmem_region region;
+                ::ioctl(pmem_device_fd, PMEM_GET_TOTAL_SIZE, &region);
+                mPmemTotalSize = region.len;
+                ::ioctl(pmem_device_fd,PMEM_ALLOCATE,mPmemTotalSize);
+            }
+        }
+        return NO_ERROR;
+    }
 
-          info->format = getFormat(V4L2_PIX_FMT_YUYV);
-          unsigned int count = m_AllFmts.size();
-          if (m_AllFmts.size() > 16)
-              count = 16;
-          for (unsigned i = 0; i < count; ++i) {
-              (info->ptable)[i].w = m_AllFmts[i].getWidth();
-              (info->ptable)[i].h = m_AllFmts[i].getHeight();
-                   
-          }
-          return NO_ERROR;
-     }
+    void CameraV4L2Device::deInitPmem(void) {
+        if (pmem_device_fd > 0) {
+            close(pmem_device_fd);
+            pmem_device_fd = -1;
+            mPmemTotalSize = 0;
+        }
+    }
 
+    int CameraV4L2Device::connectDevice(int id)
+    {
+        status_t res = NO_ERROR;
+        ALOGV("connect %s camera, state: %d, fd: %d",device_name,
+              V4L2DeviceState, device_fd);
 
-     int CameraV4L2Device::getCurrentCameraId(void)
-     {
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return currentId;
-     }
+        if (V4L2DeviceState & DEVICE_CONNECTED) {
+            ALOGV("%s: %s already connect",__FUNCTION__, device_name);
+            return res;
+        }
 
-     void CameraV4L2Device::Close(void)
-     {
-          if (videoIn->tmpBuffer)
-               free(videoIn->tmpBuffer);
-          videoIn->tmpBuffer = NULL;
+        if (device_fd < 0) {
+            res = open_device();
+            if (res == NO_ERROR) {
+                res = init_device();
+            }
 
-          if (device_fd > 0)
-               close(device_fd);
-          device_fd = -1;
-     }
+            if (id != currentId) {
+                currentId = id;
+                initDefaultControls();
+                EnumFrameFormats();
+            }
+            V4L2DeviceState = 0;
+            V4L2DeviceState |= DEVICE_CONNECTED;
+        }
 
-     int CameraV4L2Device::connectDevice(int id)
-     {
-          status_t res = NO_ERROR;
-          struct stat st;
+        if (mtlb_base == 0) {
+            dmmu_init();
+            dmmu_get_page_table_base_phys(&mtlb_base);
+        }
+        return res;
+    }
 
-          ALOGE_IF(DEBUG_V4L2,"%s:connect %d camera, state = %d",__FUNCTION__, id, V4L2DeviceState);
+    void CameraV4L2Device::disConnectDevice(void) {
 
-          if (device_fd > 0 && need_update) {
-               Close();
-               need_update = false;
-          }
+        ALOGV("%s:disconnect %d camera, state = %d",
+              __FUNCTION__,currentId,V4L2DeviceState);
 
-          if (device_fd < 0)
-          {
-               if (-1 == stat(device_name, &st)) {
-                    ALOGE("Cannot identify '%s': %d, %s", device_name, errno, strerror(errno));
-                    return NO_INIT;
-               }
-               
-               if (!S_ISCHR(st.st_mode)) {
-                    ALOGE("%s is no device", device_name);
-                    return NO_INIT;
-               }
+        struct VidState* s = &(this->s);
+        if (s->control_list != NULL) {
+            free_control_list(s->control_list);
+            s->control_list = NULL;
+        }
 
-               device_fd = open(device_name, O_RDWR|O_NONBLOCK);
+        if (device_fd > 0) {
+            close(device_fd);
+            device_fd = -1;
+            freeStream(PREVIEW_BUFFER);
+        }
 
-               if (device_fd < 0) {
+        V4L2DeviceState = DEVICE_UNINIT;
+        currentId = -1;
 
-                    res = device_fd;
-                    memset(device_name,0,256);
-                    currentId = -1;
-                    V4L2DeviceState = DEVICE_UNINIT;
-                    ALOGE("%s: can not connect %s device", __FUNCTION__,device_name);
-                    return NO_INIT;
-               }
-               
-               memset(videoIn, 0, sizeof(struct vdIn));
-               res = ::ioctl(device_fd, VIDIOC_QUERYCAP, &videoIn->cap);
-               if (res != NO_ERROR) {
-                    ALOGE("%s: opening device unable to query device.",__FUNCTION__);
-                    return NO_INIT;
-               }
-               
-               ALOGE_IF(DEBUG_V4L2,"driver: %s, card: %s, bus_info: %s, version:%d.%d.%d, capabilities: 0x%08x",
-                        (const char*)(videoIn->cap.driver), (const char*)(videoIn->cap.card),
-                        (const char*)(videoIn->cap.bus_info) ,
-                        videoIn->cap.version>>16, (videoIn->cap.version>>8)&0xff, (videoIn->cap.version)&0xff, videoIn->cap.capabilities);
+        deInitPmem();
+        if (mtlb_base > 0) {
+            dmmu_deinit();
+            mtlb_base = 0;
+        }
+        return ;
+    }
 
-               if (!(videoIn->cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
-                    ALOGE("%s: opening device: video capture not supported",__FUNCTION__);
-                    return NO_INIT;
-               }
+    int CameraV4L2Device::start_device(void) {
+        status_t res = NO_ERROR;
 
-               if (!(videoIn->cap.capabilities & V4L2_CAP_STREAMING))
-               {
-                    ALOGE("%s: not support streaming I/O",__FUNCTION__);
-                    return NO_INIT;
-               }
+        ALOGV("%s: device %s state = %d",__FUNCTION__,device_name, V4L2DeviceState);
 
-               videoIn->cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-               if (0 == ::ioctl(device_fd, VIDIOC_CROPCAP, &videoIn->cropcap)) {
-                    videoIn->crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                    videoIn->crop.c = videoIn->cropcap.defrect;
-                    if (-1 == ::ioctl(device_fd, VIDIOC_S_CROP, &videoIn->crop)) {
-                         switch(errno) {
-                         case EINVAL:
-                              ALOGE("Cropping not supported");
-                              break;
-                         default:
-                              break;
-                         }
-                    }
-               }
+        if (V4L2DeviceState & DEVICE_STARTED) {
+            ALOGV("%s: already start",__FUNCTION__);
+            return res;
+        }
 
-               if (currentId != id) {
-                   V4L2DeviceState = DEVICE_CONNECTED;
-                   currentId = id;
-                   EnumFrameFormats();
-                   initDefaultControls();
-                   dmmu_init();
-                   dmmu_get_page_table_base_phys(&mtlb_base);
-               }
-          }
-
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return res;
-     }
-
-     void CameraV4L2Device::disConnectDevice(void)
-     {
-          status_t res = NO_ERROR;
-
-          ALOGE_IF(DEBUG_V4L2,"%s: uvc disconnect %d camera, state = %d",__FUNCTION__,currentId,V4L2DeviceState);
-
-          if (V4L2DeviceState == DEVICE_STOPED)
-          {
-               if (device_fd >= 0)
-               {
-                    close(device_fd);
-                    device_fd = -1;
-               }
-               V4L2DeviceState = DEVICE_UNINIT;
-               currentId = -1;
-               dmmu_deinit();
-               mtlb_base = 0;
-          }
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return ;
-     }
-
-     int CameraV4L2Device::startDevice(void)
-     {
-          status_t res = NO_ERROR;
-
-          ALOGE_IF(DEBUG_V4L2,"%s: uvc device state = %d",__FUNCTION__,V4L2DeviceState);
-
-          if (V4L2DeviceState == DEVICE_CONNECTED || (videoIn->isStreaming == false))
-          {
-          start_device:
-               enum v4l2_buf_type type;
-               type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-               if ((res = ::ioctl(device_fd, VIDIOC_STREAMON, &type)) != NO_ERROR)
-               {
-                    ALOGE("%s: Unable to start stream",
-                          __FUNCTION__);
+        if (V4L2DeviceState & DEVICE_CONNECTED) {
+            enum v4l2_buf_type type;
+            type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            if (!videoIn->isStreaming) {
+                if ((res = ::ioctl(device_fd, VIDIOC_STREAMON, &type)) != NO_ERROR) {
+                    ALOGE("%s: Unable to start stream,err: %s",
+                          __FUNCTION__,strerror(errno));
                     return res;
-               }
-               V4L2DeviceState = DEVICE_STARTED;
-               videoIn->isStreaming = true;
-          }
+                } else {
+                    videoIn->isStreaming = true;
+                }
+            }
+            V4L2DeviceState &= ~DEVICE_STOPED;
+            V4L2DeviceState |= DEVICE_STARTED;
+            mReqLostFrameNum = LOST_FRAME_NUM;
+            ALOGD_IF(videoIn->isStreaming,"start device succss");
+        }
+        return NO_ERROR;
+    }
 
-          if (V4L2DeviceState == DEVICE_STARTED)
-               return res;
+    int CameraV4L2Device::startDevice(void)
+    {
+        switch (io) {
+        case IO_METHOD_READ:
+            return NO_ERROR;
+            break;
+        case IO_METHOD_USERPTR:
+        case IO_METHOD_MMAP:
+            return start_device();
+        }
+        ALOGE("%s: invalidy io %d",__FUNCTION__, io);
+        return BAD_VALUE;
+    }
 
-          if (V4L2DeviceState == DEVICE_STOPED)
-          {
-               goto start_device;
-          }
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return NO_ERROR;
-     }
+    int CameraV4L2Device::stop_device(void) {
 
-     int CameraV4L2Device::stopDevice(void)
-     {
-          status_t res = NO_ERROR;
+        status_t res = NO_ERROR;
 
-          ALOGE_IF(DEBUG_V4L2,"%s: uvc device state = %d",__FUNCTION__,V4L2DeviceState);
-          if (V4L2DeviceState == DEVICE_STARTED || videoIn->isStreaming)
-          {
-               enum v4l2_buf_type type;
-               type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-               if ((res = ::ioctl(device_fd, VIDIOC_STREAMOFF, &type)) != NO_ERROR)
-               {
-                    ALOGE("%s: Unable stop device",__FUNCTION__);
+        ALOGV("%s: device state = %d",__FUNCTION__,V4L2DeviceState);
+
+        if (V4L2DeviceState & DEVICE_STOPED) {
+            ALOGV("%s: already stop",__FUNCTION__);
+            return res;
+        }
+
+        if (is_capture) {
+            ALOGV("%s: use preview data capture",__FUNCTION__);
+            return NO_ERROR;
+        }
+
+        if (V4L2DeviceState & DEVICE_STARTED) {
+            enum v4l2_buf_type type;
+            type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            if (videoIn->isStreaming) {
+                if ((res = ::ioctl(device_fd, VIDIOC_STREAMOFF, &type)) != NO_ERROR) {
+                    ALOGE("%s: Unable stop device,err: %s",__FUNCTION__, strerror(errno));
                     return res;
-               }
-          }
-          Close();
-          return res;
-     }
+                } else {
+                    videoIn->isStreaming = false;
+                }
+            }
+            close(device_fd);
+            device_fd = -1;
+            V4L2DeviceState &= ~DEVICE_CONNECTED;
+            V4L2DeviceState &= ~DEVICE_STARTED;
+            V4L2DeviceState |= DEVICE_STOPED;
+            ALOGD_IF(!videoIn->isStreaming,"stop device success");
+        }
+        return NO_ERROR;
+    }
 
-     int CameraV4L2Device::getCameraModuleInfo(int camera_id, struct camera_info* info)
-     {
+    int CameraV4L2Device::stopDevice(void)
+    {
+        switch (io) {
+        case IO_METHOD_READ:
+            return NO_ERROR;
+            break;
+        case IO_METHOD_USERPTR:
+        case IO_METHOD_MMAP:
+            return stop_device();
+            break;
+        }
+        ALOGE("%s: invalidy io %d",__FUNCTION__, io);
+        return BAD_VALUE;
+    }
 
-          if (camera_id == 0)
-          {
-               info->facing = CAMERA_FACING_BACK;
-               info->orientation = 90;
-          } else if(camera_id == 1)
-          {
-               info->facing = CAMERA_FACING_FRONT;
-               info->orientation = 270;
-          }
+    int CameraV4L2Device::getCameraModuleInfo(int camera_id, struct camera_info* info)
+    {
+        if ((mglobal_info.sensor_count == 1)
+            || (camera_id == 1)) {
+            info->facing = CAMERA_FACING_FRONT;
+            info->orientation = 0;
+            ALOGV("%s: id: %d, facing: %s, orientation: %d",__FUNCTION__, 1,"front camera",0);
+        } else if (camera_id == 0) {
+            info->facing = CAMERA_FACING_BACK;
+            info->orientation = 0;
+            ALOGV("%s: id: %d, facing: %s, orientation: %d",__FUNCTION__, 0,"back camera", 0);
+        }
+        return NO_ERROR;
+    }
 
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return NO_ERROR;
-     }
+    int CameraV4L2Device::getCameraNum(void)
+    {
+        int nr = 0;
+        nr = mglobal_info.sensor_count;
+        ALOGV("%s: num camera: %d",__FUNCTION__,nr);
+        return nr;
+    }
 
-     int CameraV4L2Device::getCameraNum(void)
-     {
-          int nr = 0;
+    int CameraV4L2Device::sendCommand(uint32_t cmd_type, uint32_t arg1, uint32_t arg2, uint32_t result)
+    {
+        status_t res = NO_ERROR;
 
-          nr = mglobal_info.sensor_count;
+        ALOGV("%s:device state = %d, cmd_type = %d",__FUNCTION__,V4L2DeviceState, cmd_type);
+        switch(cmd_type)
+            {
+            case FOCUS_INIT:
+                ALOGV("FOCUS_INIT");
+                is_capture = false;
+                break;
+            case PAUSE_FACE_DETECT:
+                ALOGV("PAUSE_FACE_DETECT");
+                break;
+            case START_FOCUS:
+                ALOGV("START_FOCUS");
+                break;
+            case GET_FOCUS_STATUS:
+                ALOGV("GET_FOCUS_STATUS");
+                break;
+            case START_PREVIEW:
+                ALOGV("START_PREVIEW");
+                break;
+            case STOP_PREVIEW:
+                ALOGV("STOP_PREVIEW");
+                break;
+            case START_ZOOM:
+                ALOGV("START_ZOOM");
+                mEnablestartZoom = true;
+                break;
+            case STOP_ZOOM:
+                ALOGV("STOP_ZOOM");
+                mEnablestartZoom = false;
+                break;
+            case START_FACE_DETECT:
+                ALOGV("START_FACE_DETECT");
+                break;
+            case STOP_FACE_DETECT:
+                ALOGV("STOP_FACE_DETECT");
+                break;
+            case INIT_TAKE_PICTURE:
+                ALOGV("INIT_TAKE_PICTURE");
+                is_capture = true;
+                break;
+            case TAKE_PICTURE: {
+                ALOGV("TAKE_PICTURE");
+                void* ptr = getCurrentFrame();
+                if (ptr != NULL) {
+                    return (int)ptr;
+                } else {
+                    ALOGE("%s: get frame error",__FUNCTION__);
+                    return 0;
+                }
+            }
+                break;
+            case STOP_PICTURE:
+                ALOGV("STOP_PICTURE");
+                is_capture = false;
+                break;
+            }
 
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return nr;
-     }
+        return NO_ERROR;
+    }
 
-     int CameraV4L2Device::sendCommand(uint32_t cmd_type, uint32_t arg1, uint32_t arg2, uint32_t result)
-     {
-          status_t res = NO_ERROR;
+    void CameraV4L2Device::initTakePicture(int width,int height,
+         camera_request_memory get_memory) {
+        ALOGV("Enter %s,state: %d",__FUNCTION__, V4L2DeviceState);
 
-          ALOGE_IF(DEBUG_V4L2,"%s: uvc device state = %d",__FUNCTION__,V4L2DeviceState);
-          switch(cmd_type)
-          {
-          case PAUSE_FACE_DETECT:
-               break;
-          case START_FOCUS:
-               break;
-          case GET_FOCUS_STATUS:
-               break;
-          case START_PREVIEW:
-               break;
-          case STOP_PREVIEW:
-               break;
-          case START_ZOOM:
-               break;
-          case STOP_ZOOM:
-               break;
-          case START_FACE_DETECT:
-               break;
-          case STOP_FACE_DETECT:
-               break;
-          case TAKE_PICTURE:
-          {
-               int width = arg1;
-               int height = arg2;
+        int res = NO_ERROR;
+        res = connectDevice(currentId);
 
-               res = connectDevice(currentId);
-               if (res == NO_ERROR) {
-                    InitParam(width, height, 1);
-                    res = allocV4L2Buffer();
-                    if (res == NO_ERROR) {
-                         startDevice();
-                    } else {
-                         ALOGE("alloc v4l2buffer error");
-                    }
-               }
-          }
-          break;
-          case STOP_PICTURE:
-               break;
-          }
-          ALOGE_IF(DEBUG_V4L2,"Exit %s, line=%d",__FUNCTION__,__LINE__);
-          return NO_ERROR;
-     }
+        if (res == NO_ERROR) {
+            mpreviewFormatV4l = V4L2_PIX_FMT_YUYV;
+            res = allocateStream(PREVIEW_BUFFER,get_memory,
+                width,height,HAL_PIXEL_FORMAT_YCbCr_422_I);
+        }
 
-     void CameraV4L2Device::EnumFrameFormats()
-     {
-          ALOGE_IF(DEBUG_V4L2, "Enter %s",__FUNCTION__);
+        if (res == NO_ERROR) {
+            res = startDevice();
+        }
+        if (res == NO_ERROR) {
+            mReqLostFrameNum = 0;
+        }
+        ALOGE_IF(res != NO_ERROR, "%s: error: %s",__FUNCTION__, strerror(errno));
+    }
+
+    void CameraV4L2Device::deInitTakePicture(void) {
+        ALOGV("Enter %s",__FUNCTION__);
+    }
+
+    bool CameraV4L2Device::getZoomState(void) {
+        ALOGV("Enter %s",__FUNCTION__);
+        return mEnablestartZoom;
+    }
+
+    void CameraV4L2Device::EnumFrameFormats()
+    {
+        ALOGV( "Enter %s",__FUNCTION__);
         
-          struct v4l2_fmtdesc fmt;
+        struct v4l2_fmtdesc fmt;
+        m_AllFmts.clear();
+
+        memset(&fmt, 0, sizeof(struct v4l2_fmtdesc));
+        fmt.index = 0;
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+        while(::ioctl(device_fd, VIDIOC_ENUM_FMT, &fmt) >= 0) {
+            fmt.index++;
+
+            if (!EnumFrameSizes(fmt.pixelformat)) {
+                ALOGE("Unable to enumerate frame sizes.");
+            }
+        }
         
-          m_AllFmts.clear();
+        m_BestPreviewFmt = frameInterval();
+        m_BestPictureFmt = frameInterval();
 
-          memset(&fmt, 0, sizeof(struct v4l2_fmtdesc));
-          fmt.index = 0;
-          fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        unsigned int i;
+        for (i=0; i < m_AllFmts.size(); i++) {
+            frameInterval f = m_AllFmts[i];
 
-          while(::ioctl(device_fd, VIDIOC_ENUM_FMT, &fmt) >= 0) {
-               fmt.index++;
+            if ((f.getWidth() > m_BestPictureFmt.getWidth()
+                 && f.getHeight() > m_BestPictureFmt.getHeight())
+                || ((f.getWidth() == m_BestPictureFmt.getWidth()
+                    && f.getHeight() == m_BestPictureFmt.getHeight())
+                    && f.getFps() < m_BestPictureFmt.getFps())) {
+                m_BestPictureFmt = f;
+            }
 
-               if (!EnumFrameSizes(fmt.pixelformat)) {
-                    ALOGE("Unable to enumerate frame sizes.");
-               }
-          }
+            if ((f.getFps() > m_BestPreviewFmt.getFps()) ||
+                (f.getFps() == m_BestPreviewFmt.getFps()
+                  && (f.getWidth() > m_BestPictureFmt.getWidth()
+                  && f.getHeight() > m_BestPictureFmt.getHeight()))) {
+                m_BestPreviewFmt = f;
+            }
+        }
+        return;
+    }
+
+    bool CameraV4L2Device::EnumFrameSizes(int pixfmt)
+    {
+        int ret = 0;
+        int fsizeind = 0;
+        struct v4l2_frmsizeenum fsize;
+
+        memset(&fsize, 0, sizeof(fsize));
+        fsize.index = 0;
+        fsize.pixel_format = pixfmt;
+
+        while(::ioctl(device_fd, VIDIOC_ENUM_FRAMESIZES, &fsize) >= 0) {
+            fsize.index++;
+            if (fsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+                fsizeind++;
+                if (!EnumFrameIntervals(pixfmt, fsize.discrete.width, fsize.discrete.height)) {
+                    ALOGE("Unable to enumerate frame indervals");
+                }
+            }else if (fsize.type == V4L2_FRMSIZE_TYPE_CONTINUOUS) {
+                ALOGE("Will not enumerate frame intervals.");
+            } else if (fsize.type == V4L2_FRMSIZE_TYPE_STEPWISE) {
+                ALOGE("Will not enumerate frame intervals.");
+            } else {
+                ALOGE("fsize.type not supported: %d", fsize.type);
+            }
+        }
+        return fsizeind != 0;
+    }
+
+    bool CameraV4L2Device::EnumFrameIntervals(int pixfmt, int width, int height)
+    {
+        struct v4l2_frmivalenum fival;
+        int list_fps = 0;
+        memset(&fival, 0, sizeof(fival));
+        fival.index = 0;
+        fival.pixel_format = pixfmt;
+        fival.width = width;
+        fival.height = height;
+
+        while(::ioctl(device_fd, VIDIOC_ENUM_FRAMEINTERVALS, &fival) >= 0) {
+            fival.index++;
+            if (fival.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
+                m_AllFmts.add(frameInterval(width, height, fival.discrete.denominator));
+                list_fps++;
+            } else if (fival.type == V4L2_FRMIVAL_TYPE_CONTINUOUS) {
+                break;
+            } else if (fival.type == V4L2_FRMIVAL_TYPE_STEPWISE) {
+                break;
+            }
+        }
+        if (list_fps == 0) {
+            m_AllFmts.add(frameInterval(width, height, 1));
+        }
+        return true;
+    }
+
+    void CameraV4L2Device::initDefaultControls(void) {
+
+        struct VidState* s = &(this->s);
+        if (s->control_list != NULL) {
+            free_control_list(s->control_list);
+            s->control_list = NULL;
+        }
+
+        s->num_controls = 0;
+        s->control_list = get_control_list(device_fd, &(s->num_controls));
         
-          m_BestPreviewFmt = frameInterval();
-          m_BestPictureFmt = frameInterval();
+        if (s->control_list == NULL) {
+            ALOGE("Error: empty control list");
+            return;
+        }
+        return;
+    }
 
-          unsigned int i;
-          for (i=0; i < m_AllFmts.size(); i++) {
-               frameInterval f = m_AllFmts[i];
+    void CameraV4L2Device::free_control_list(Control* control_list)
+    {
+        Control* first = control_list;
+        Control* next = control_list->next;
+        while(next != NULL) {
+            if (first->str != NULL) {
+                free(first->str);
+                first->str = NULL;
+            }
+            if (first->menu != NULL) {
+                free(first->menu);
+                first->menu = NULL;
+            }
+            free(first);
+            first = next;
+            next = first->next;
+        }
+        if (first->str != NULL) {
+            free(first->str);
+            first->str = NULL;
+        }
+        if (first != NULL) {
+            free(first);
+            first = NULL;
+        }
+        control_list = NULL;
+    }
 
-               if ((f.getWidth() > m_BestPictureFmt.getWidth() && f.getHeight() > m_BestPictureFmt.getHeight())
-                   || ((f.getWidth() == m_BestPictureFmt.getWidth() && f.getHeight() == m_BestPictureFmt.getHeight())
-                       && f.getFps() < m_BestPictureFmt.getFps())) {
-                    m_BestPictureFmt = f;
-               }
+    Control* CameraV4L2Device::get_control_list(int hdevice, int* num_ctrls) {
 
-               if ((f.getFps() > m_BestPreviewFmt.getFps()) ||
-                   (f.getFps() == m_BestPreviewFmt.getFps() && 
-                    (f.getWidth() > m_BestPictureFmt.getWidth() && f.getHeight() > m_BestPictureFmt.getHeight()))) {
-                    m_BestPreviewFmt = f;
-               }
-          }
-          return;
-     }
+        int ret = 0;
+        Control* first = NULL;
+        Control* current = NULL;
+        Control* control = NULL;
 
-     bool CameraV4L2Device::EnumFrameSizes(int pixfmt)
-     {
-          ALOGE_IF(DEBUG_V4L2,"Enter %s",__FUNCTION__);
-          int ret = 0;
-          int fsizeind = 0;
-          struct v4l2_frmsizeenum fsize;
+        int n = 0;
+        struct v4l2_queryctrl queryctrl;
+        struct v4l2_querymenu querymenu;
 
-          memset(&fsize, 0, sizeof(fsize));
-          fsize.index = 0;
-          fsize.pixel_format = pixfmt;
+        memset(&queryctrl, 0, sizeof(struct v4l2_queryctrl));
+        memset(&querymenu, 0, sizeof(struct v4l2_querymenu));
 
-          while(::ioctl(device_fd, VIDIOC_ENUM_FRAMESIZES, &fsize) >= 0) {
-               fsize.index++;
-               if (fsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
-                    fsizeind++;
-                    if (!EnumFrameIntervals(pixfmt, fsize.discrete.width, fsize.discrete.height)) {
-                         ALOGE("Unable to enumerate frame indervals");
-                    }
-               }else if (fsize.type == V4L2_FRMSIZE_TYPE_CONTINUOUS) {
-                    ALOGE("Will not enumerate frame intervals.");
-               } else if (fsize.type == V4L2_FRMSIZE_TYPE_STEPWISE) {
-                    ALOGE("Will not enumerate frame intervals.");
-               } else {
-                    ALOGE("fsize.type not supported: %d", fsize.type);
-               }                
-          }
-          //176x144,320x240,352x288,640x480,720x480,720x576,800x600,1280x720
-          if (fsizeind == 0) {
-               static const struct {
-                    int w;
-                    int h;
-               }defMode[] = {
-                    {1280, 720},
-                    {800, 600},
-                    {720, 576},
-                    {720, 480},
-                    {640, 480},
-                    {352, 288},
-                    {320, 240},
-                    {176, 144}
-               };
+        int currentctrl;
+        for (currentctrl=V4L2_CID_BASE;
+               currentctrl<V4L2_CID_LASTP1;
+               currentctrl++) {
+            struct v4l2_querymenu *menu = NULL;
+            queryctrl.id = currentctrl;
+            ret = ::ioctl(hdevice, VIDIOC_QUERYCTRL, &queryctrl);
+            if (ret || (queryctrl.flags & V4L2_CTRL_FLAG_DISABLED))
+                continue;
+            ALOGV("ID: 0x%x, Control name: %s", queryctrl.id, (const char*)queryctrl.name);
+            if (queryctrl.type == V4L2_CTRL_TYPE_MENU) {
+                int i = 0;
+                int ret = 0;
+                for (querymenu.index = queryctrl.minimum;
+                     (int)(querymenu.index) <= queryctrl.maximum;
+                     querymenu.index++) {
+                    querymenu.id = queryctrl.id;
+                    ret = ::ioctl(hdevice ,VIDIOC_QUERYMENU , &querymenu);
+                    if (ret < 0)
+                        break;
+                    ALOGV("    menu name: %s",(const char*)querymenu.name);
+                    if (!menu)
+                        menu = (struct v4l2_querymenu*)calloc((i+1),sizeof(struct v4l2_querymenu));
+                    else
+                        menu = (struct v4l2_querymenu*)realloc(menu, (i+1) * sizeof(struct v4l2_querymenu));
+                    memcpy(&(menu[i]), &querymenu, sizeof(struct v4l2_querymenu));
+                    i++;
+                }
 
-               unsigned int i;
-               for (i=0; i < sizeof(defMode)/sizeof(defMode[0]); ++i) {
-                    fsizeind++;
-                    struct v4l2_format fmt;
-                    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                    fmt.fmt.pix.width = defMode[i].w;
-                    fmt.fmt.pix.height = defMode[i].h;
-                    fmt.fmt.pix.pixelformat = pixfmt;
-                    fmt.fmt.pix.field = V4L2_FIELD_INTERLACED;//V4L2_FIELD_ANY;
+                if (!menu)
+                    menu = (struct v4l2_querymenu*)calloc((i+1),sizeof(struct v4l2_querymenu));
+                else
+                    menu = (struct v4l2_querymenu*)realloc(menu, (i+1) * sizeof(struct v4l2_querymenu));
 
-                    if (::ioctl(device_fd, VIDIOC_TRY_FMT, &fmt) >= 0) {
-                         m_AllFmts.add(frameInterval(fmt.fmt.pix.width, fmt.fmt.pix.height, 25));
-                    }
-               }
-          }
-          return true;
-     }
+                menu[i].id = querymenu.id;
+                menu[i].index = queryctrl.maximum+1;
+                menu[i].name[0] = 0;
+            }
 
-     bool CameraV4L2Device::EnumFrameIntervals(int pixfmt, int width, int height)
-     {
-          ALOGE_IF(DEBUG_V4L2, "Enter %s",__FUNCTION__);
+            control = (Control*)calloc(1, sizeof(Control));
+            memcpy(&(control->control), &queryctrl, sizeof(struct v4l2_queryctrl));
+            control->ctrl_class = 0x00980000;
+            control->menu = menu;
 
-          struct v4l2_frmivalenum fival;
-          int list_fps = 0;
-          memset(&fival, 0, sizeof(fival));
-          fival.index = 0;
-          fival.pixel_format = pixfmt;
-          fival.width = width;
-          fival.height = height;
+            if (first != NULL) {
+                current->next = control;
+                current = control;
+            } else {
+                first = control;
+                current = control;
+            }
+            n++;
+        }
 
-          while(::ioctl(device_fd, VIDIOC_ENUM_FRAMEINTERVALS, &fival) >= 0) {
-               fival.index++;
-               if (fival.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
-                    m_AllFmts.add(frameInterval(width, height, fival.discrete.denominator));
-                    list_fps++;
-               } else if (fival.type == V4L2_FRMIVAL_TYPE_CONTINUOUS) {
-                    break;
-               } else if (fival.type == V4L2_FRMIVAL_TYPE_STEPWISE) {
-                    break;
-               }
-          }
-          if (list_fps == 0) {
-               m_AllFmts.add(frameInterval(width, height, 1));
-          }
-          return true;
-     }
+        for (queryctrl.id=V4L2_CID_PRIVATE_BASE; ;
+             queryctrl.id++) {
+            struct v4l2_querymenu *menu = NULL;
+            ret = ::ioctl(hdevice, VIDIOC_QUERYCTRL, &queryctrl);
+            if (ret)
+                break;
+            else if (queryctrl.flags & V4L2_CTRL_FLAG_DISABLED)
+                continue;
+            ALOGV("ID: 0x%x, Control name: %s", queryctrl.id, (const char*)queryctrl.name);
+            if (queryctrl.type == V4L2_CTRL_TYPE_MENU) {
+                int i = 0;
+                int ret = 0;
+                for (querymenu.index = queryctrl.minimum;
+                     (int)(querymenu.index) <= queryctrl.maximum;
+                     querymenu.index++) {
+                    querymenu.id = queryctrl.id;
+                    ret = ::ioctl(hdevice, VIDIOC_QUERYMENU, &querymenu);
+                    if (ret < 0)
+                        break;
+                    ALOGV("    menu name: %s",(const char*)querymenu.name);
+                    if (!menu)
+                        menu = (struct v4l2_querymenu*)calloc(i+1, sizeof(struct v4l2_querymenu));
+                    else
+                        menu = (struct v4l2_querymenu*)realloc(menu, (i+1) * sizeof(struct v4l2_querymenu));
+                    memcpy(&(menu[i]), &querymenu, sizeof( struct v4l2_querymenu));
+                    i++;
+                }
+                if (!menu)
+                    menu = (struct v4l2_querymenu*) calloc(i+1, sizeof(struct v4l2_querymenu));
+                else
+                    menu = (struct v4l2_querymenu*)realloc(menu, (i+1)*(sizeof(struct v4l2_querymenu)));
+                menu[i].id = querymenu.id;
+                menu[i].index = queryctrl.maximum+1;
+                menu[i].name[0]=0;
+            }
 
-     void CameraV4L2Device::initDefaultControls(void)
-     {
-          struct VidState* s = this->s;
+            control = (Control*)calloc(1, sizeof(Control));
+            memcpy(&(control->control),&queryctrl, sizeof(struct v4l2_queryctrl));
+            control->menu = menu;
 
-          if (s->control_list)
-          {
-               free_control_list(s->control_list);
-          }
-        
-          s->num_controls = 0;
-          s->control_list = get_control_list(device_fd, &(s->num_controls));
-        
-          if (!s->control_list) {
-               ALOGE("Error: empty control list");
-               return;
-          }
-          /**
-           * will write in future
-           */
-          return;
-     }
-
-     void CameraV4L2Device::free_control_list(Control* control_list)
-     {
-          Control* first = control_list;
-          Control* next = control_list->next;
-          while(next != NULL) {
-               if (first->str) free(first->str);
-               if (first->menu) free(first->menu);
-               free(first);
-               first = next;
-               next = first->next;
-          }
-          if (first->str) free(first->str);
-          if (first) free(first);
-          control_list = NULL;
-     }
-
-     Control* CameraV4L2Device::get_control_list(int hdevice, int* num_ctrls) {
-
-          int ret = 0;
-          Control* first = NULL;
-          Control* current = NULL;
-          Control* control = NULL;
-
-          int n = 0;
-          struct v4l2_queryctrl queryctrl;
-          struct v4l2_querymenu querymenu;
-
-          memset(&queryctrl, 0, sizeof(struct v4l2_queryctrl));
-          memset(&querymenu, 0, sizeof(struct v4l2_querymenu));
-
-          unsigned int currentctrl = 0;
-          queryctrl.id = 0 | V4L2_CTRL_FLAG_NEXT_CTRL;
-#ifdef V4L2_CTRL_FLAG_NEXT_CTRL
-          if (0 == ::ioctl(hdevice, VIDIOC_QUERYCTRL, &queryctrl)) {
-               queryctrl.id = 0;
-               currentctrl = queryctrl.id;
-               queryctrl.id |=V4L2_CTRL_FLAG_NEXT_CTRL;
-               while ((ret = ::ioctl(hdevice, VIDIOC_QUERYCTRL, &queryctrl)), 
-                      ret ? errno != EINVAL : 1) {
-                    struct v4l2_querymenu *menu = NULL;
-
-                    if (ret && queryctrl.id <= currentctrl) {
-                         currentctrl++;
-                         queryctrl.id = currentctrl;
-                         goto next_control;
-                    } else if ((queryctrl.id == V4L2_CTRL_FLAG_NEXT_CTRL) || 
-                               (!ret && queryctrl.id == currentctrl)) {
-                         *num_ctrls = n;
-                         return first;                        
-                    }
-                    currentctrl = queryctrl.id;
-                    if (ret) goto next_control;
-                    if (queryctrl.flags & V4L2_CTRL_FLAG_DISABLED) {
-                         goto next_control;
-                    }
-
-                    if (queryctrl.type == V4L2_CTRL_TYPE_MENU) {
-                         int i = 0;
-                         int ret = 0;
-
-                         for (querymenu.index = queryctrl.minimum;
-                              (int)(querymenu.index) <= queryctrl.maximum;
-                              querymenu.index++) {
-                              querymenu.id = queryctrl.id;
-                              ret = ::ioctl(hdevice, VIDIOC_QUERYMENU, &querymenu);
-                              if (ret < 0) continue;
-                              if (!menu)
-                                   menu = (struct v4l2_querymenu *)calloc(i+1, sizeof(struct v4l2_querymenu ));
-                              else
-                                   menu  = (struct v4l2_querymenu *)realloc(menu, (i+1)*(sizeof(struct v4l2_querymenu )));
-                              memcpy(&menu[i], &querymenu, sizeof(struct v4l2_querymenu));
-                              i++;
-                         }
-                         if (!menu)
-                              menu = (struct v4l2_querymenu*)calloc(i+1, sizeof(struct v4l2_querymenu));
-                         else
-                              menu  = (struct v4l2_querymenu *)realloc(menu, (i+1)*(sizeof(struct v4l2_querymenu )));
-                         menu[i].id = queryctrl.id;
-                         menu[i].index = queryctrl.maximum+1;
-                         menu[i].name[0] = 0;
-                    }
-                    control = (Control*)calloc(1, sizeof(Control));
-                    memcpy (&(control->control), &queryctrl, sizeof(struct v4l2_queryctrl));
-                    control->ctrl_class = V4L2_CTRL_ID2CLASS(control->control.id);
-                    control->menu = menu;
-                    control->str = NULL;
-
-                    if (first != NULL) {
-                         current->next = control;
-                         current = control;
-                    } else {
-                         first = control;
-                         current = first;
-                    }
-                    n++;
-               next_control:
-                    queryctrl.id |= V4L2_CTRL_FLAG_NEXT_CTRL;
-               }
-          } else
-#endif
-          {
-               /**
-                * will write in future
-                */
-               int currentctrl;
-               for (currentctrl = V4L2_CID_BASE; currentctrl < V4L2_CID_LASTP1; currentctrl++) {
-                    struct v4l2_querymenu *menu = NULL;
-                    queryctrl.id = currentctrl;
-                    ret = ::ioctl(hdevice, VIDIOC_QUERYCTRL, &queryctrl);
-                    if (ret || (queryctrl.flags & V4L2_CTRL_FLAG_DISABLED))
-                         continue;
-
-                    if (queryctrl.type == V4L2_CTRL_TYPE_MENU) {
-                         int i = 0;
-                         int ret = 0;
-                         for (querymenu.index = queryctrl.minimum;
-                              (int)(querymenu.index) <= queryctrl.maximum;
-                              querymenu.index++) {
-                              querymenu.id = queryctrl.id;
-                              ret = ::ioctl(hdevice ,VIDIOC_QUERYMENU , &querymenu);
-                              if (ret < 0)
-                                   break;
-
-                              if (!menu)
-                                   menu = (struct v4l2_querymenu*)calloc((i+1),sizeof(struct v4l2_querymenu));
-                              else
-                                   menu = (struct v4l2_querymenu*)realloc(menu, (i+1) * sizeof(struct v4l2_querymenu));
-                              memcpy(&(menu[i]), &querymenu, sizeof(struct v4l2_querymenu));
-                              i++;
-                         }
-
-                         if (!menu)
-                              menu = (struct v4l2_querymenu*)calloc((i+1),sizeof(struct v4l2_querymenu));
-                         else
-                              menu = (struct v4l2_querymenu*)realloc(menu, (i+1) * sizeof(struct v4l2_querymenu));
-
-                         menu[i].id = querymenu.id;
-                         menu[i].index = queryctrl.maximum+1;
-                         menu[i].name[0] = 0;
-                    }
-                    control = (Control*)calloc(1, sizeof(Control));
-                    memcpy(&(control->control), &queryctrl, sizeof(struct v4l2_queryctrl));
-                    control->ctrl_class = 0x00980000;
-                    control->menu = menu;
-                    
-                    if (first != NULL) {
-                         current->next = control;
-                         current = control;
-                    } else {
-                         first = control;
-                         current = control;
-                    }
-                    n++;
-               }
-
-               for (queryctrl.id = V4L2_CID_PRIVATE_BASE; ; queryctrl.id++) {
-                    struct v4l2_querymenu *menu = NULL;
-                    ret = ::ioctl(hdevice, VIDIOC_QUERYCTRL, &queryctrl);
-                    if (ret)
-                         break;
-                    else if (queryctrl.flags & V4L2_CTRL_FLAG_DISABLED)
-                         continue;
-
-                    if (queryctrl.type == V4L2_CTRL_TYPE_MENU) {
-                         int i = 0;
-                         int ret = 0;
-                         for (querymenu.index = queryctrl.minimum;
-                              (int)(querymenu.index) <= queryctrl.maximum;
-                              querymenu.index++) {
-                              querymenu.id = queryctrl.id;
-                              ret = ::ioctl(hdevice, VIDIOC_QUERYMENU, &querymenu);
-                              if (ret < 0)
-                                   break;
-                              if (!menu)
-                                   menu = (struct v4l2_querymenu*)calloc(i+1, sizeof(struct v4l2_querymenu));
-                              else
-                                   menu = (struct v4l2_querymenu*)realloc(menu, (i+1) * sizeof(struct v4l2_querymenu));
-                              memcpy(&(menu[i]), &querymenu, sizeof( struct v4l2_querymenu));
-                              i++;                                  
-                         }
-                         if (!menu)
-                              menu = (struct v4l2_querymenu*) calloc(i+1, sizeof(struct v4l2_querymenu));
-                         else
-                              menu = (struct v4l2_querymenu*)realloc(menu, (i+1)*(sizeof(struct v4l2_querymenu)));
-                         menu[i].id = querymenu.id;
-                         menu[i].index = queryctrl.maximum+1;
-                         menu[i].name[0]=0;
-                    }
-                    control = (Control*)calloc(1, sizeof(Control));
-                    memcpy(&(control->control),&queryctrl, sizeof(struct v4l2_queryctrl));
-                    control->menu = menu;
-
-                    if (first != NULL) {
-                         current->next = control;
-                         current = control;
-                    } else {
-                         first = control;
-                         current = first;
-                    }
-                    n++;
-               }
-          }
-          *num_ctrls = n;
-          return first;
-     }
+            if (first != NULL) {
+                current->next = control;
+                current = control;
+            } else {
+                first = control;
+                current = first;
+            }
+            n++;
+        }
+        *num_ctrls = n;
+        ALOGV("%s: num ctrl: %d",__FUNCTION__, n);
+        return first;
+    }
 };

@@ -9,12 +9,10 @@
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
  */
-
 #define LOG_TAG  "CameraHal1"
-#define DEBUG_HAL1 0
-#define DEBUG_PREVIEW_THREAD 0
-#define DEBUG_VIDEO_RECORDING 0
-//#define CAMERA_USE_SOFT
+//#define LOG_NDEBUG 0
+
+#define LOST_FRAME_NUM 1
 
 #include "CameraHalSelector.h"
 #include "CameraFaceDetect.h"
@@ -22,6 +20,12 @@
 #ifndef PIXEL_FORMAT_YV16
 #define PIXEL_FORMAT_YV16  0x36315659 /* YCrCb 4:2:2 Planar */
 #endif
+
+#define WAIT_TIME (1000000000LL * 60)
+#ifdef ENCODE_BY_HARDWARE
+#define START_CAMERA_COLOR_CONVET_THREAD
+#endif
+//#define CONVERTER_PMON
 
 namespace android{
 
@@ -32,6 +36,7 @@ namespace android{
          mDevice(device),
          ccc(NULL),
          mCameraModuleDev(NULL),
+         mModuleOpened(false),
          mnotify_cb(NULL),
          mdata_cb(NULL),
          mdata_cb_timestamp(NULL),
@@ -44,29 +49,37 @@ namespace android{
          mRawPreviewWidth(0),
          mRawPreviewHeight(0),
          mPreviewFmt(HAL_PIXEL_FORMAT_YV12),
+         mPreviewWidth(0),
+         mPreviewHeight(0),
          mPreviewFrameSize(0),
          mPreviewHeap(NULL),
          mPreviewIndex(0),
          mPreviewEnabled(false),
-         mRecFmt(HAL_PIXEL_FORMAT_JZ_YUV_420_B),
          mRecordingFrameSize(0),
          mRecordingHeap(NULL),
          mRecordingindex(0),
          mVideoRecEnabled(false),
+         mtotaltime(0),
+         mtotalnum(0),
          mTakingPicture(false),
+         mPicturewidth(0),
+         mPictureheight(0),
          mPreviewWinFmt(HAL_PIXEL_FORMAT_RGB_565),
+         mPrebytesPerPixel(2),
          mPreviewWinWidth(0),
          mPreviewWinHeight(0),
          mCurFrameTimestamp(0),
          mCurrentFrame(NULL),
          mFaceCount(0),
+         mzoomVal(0),
+         mzoomRadio(100),
          isSoftFaceDetectStart(false),
          mipu(NULL),
          ipu_open_status(false),
-         first_init_ipu(true),
+         init_ipu_first(false),
          x2d_fd(-1),
-         mdrop_frame(0),
-         camera_state(CAMERA_NONE),
+         mreceived_cmd(false),
+         mSensorListener(NULL),
          mWorkerThread(NULL),
          mFocusThread(NULL) {
 
@@ -89,18 +102,14 @@ namespace android{
                 ALOGE("%s: could not create work thread", __FUNCTION__);
             }
             mFocusThread = new AutoFocusThread(this);
-            if (mFocusThread.get() == NULL) {
+            if (getAutoFocusThread() == NULL) {
                 ALOGE("%s: could not create focus thread", __FUNCTION__);
-            }
-            mWorkerQueue = new WorkQueue(10,false);
-            if (mWorkerQueue == NULL) {
-                ALOGE("%s: could not create WorkQueue",__FUNCTION__);
             }
         }
     }
 
-    CameraHal1::~CameraHal1()
-    {
+    CameraHal1::~CameraHal1() {
+
         if (ccc != NULL) {
             delete ccc;
             ccc = NULL;
@@ -115,40 +124,17 @@ namespace android{
             delete mJzParameters;
             mJzParameters = NULL;
         }
-
-        if (getWorkThread() != NULL) {
-            getWorkThread()->stopThread();
-            mWorkerThread.clear();
-        }
-        if (mFocusThread.get() != NULL) {
-            mFocusThread.get()->stopThread();
-            mFocusThread.clear();
-        }
-          
-        if (mWorkerQueue != NULL) {
-            mWorkerQueue->cancel();
-            mWorkerQueue->finish();
-            delete mWorkerQueue;
-            mWorkerQueue = NULL;
-        }
-
-        if (mPreviewHeap) {
-            mPreviewHeap->release(mPreviewHeap);
-            mPreviewHeap = NULL;
-        }
-
-        if (mRecordingHeap) {
-            mRecordingHeap->release(mRecordingHeap);
-            mRecordingHeap = NULL;
-        }
-
+        mWorkerThread.clear();
+        mWorkerThread = NULL;
+        mFocusThread.clear();
+        mFocusThread = NULL;
+        mModuleOpened = false;
         delete CameraFaceDetect::getInstance();
-
     }
 
     void CameraHal1::update_device(CameraDeviceCommon* device) {
         mDevice = device;
-        ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
+        mJzParameters->update_device(mDevice);
     }
 
     int CameraHal1::module_open(const hw_module_t* module, const char* id, hw_device_t** device) {
@@ -165,6 +151,7 @@ namespace android{
             mCameraModuleDev->priv = this;
             *device = &(mCameraModuleDev->common);
             ret = initialize();
+            mModuleOpened = true;
         }
         return ret;
     }
@@ -184,14 +171,17 @@ namespace android{
             return ret;
         }
 
-        ALOGE_IF(DEBUG_HAL1,"%s: Enter",__FUNCTION__);
         info->device_version = CAMERA_MODULE_API_VERSION_1_0;
         info->static_camera_characteristics = (camera_metadata_t*)0xcafef00d;
         if (NULL != mDevice) {
-            ALOGE_IF(DEBUG_HAL1,"%s: will getCameraModuleInfo id = %d, ",__FUNCTION__,camera_id);
+            ALOGV("%s: will getCameraModuleInfo id = %d, ",__FUNCTION__,camera_id);
             ret = mDevice->getCameraModuleInfo(mcamera_id, info);
-            if (ret == NO_ERROR && info->facing == CAMERA_FACING_FRONT) {
-                mirror = true;
+            if (ret == NO_ERROR) {
+                if (info->facing == CAMERA_FACING_FRONT) {
+                    mirror = true;
+                } else {
+                    mirror = false;
+                }
             }
         }
         return ret;
@@ -201,6 +191,24 @@ namespace android{
         status_t ret = NO_ERROR;
         mDevice->connectDevice(mcamera_id);
         mJzParameters->initDefaultParameters(mirror?CAMERA_FACING_FRONT:CAMERA_FACING_BACK);
+        getWorkThread()->startThread(false);
+        mWorkerQueue = new WorkQueue(10,false);
+
+        mHal1SignalThread = new Hal1SignalThread(this);
+        mHal1SignalThread->Start("SignalThread",PRIORITY_DEFAULT, 0);
+
+        mHal1SignalRecordingVideo = new Hal1SignalRecordingVideo(this);
+        mHal1SignalRecordingVideo->Start("RecordingThread",PRIORITY_DEFAULT, 0);
+        //register for sensor events
+        mSensorListener = new SensorListener();
+        if (mSensorListener.get()) {
+            if (mSensorListener->initialize() == NO_ERROR) {
+                mSensorListener->enableSensor(SensorListener::SENSOR_ORIENTATION);
+            } else {
+                mSensorListener.clear();
+                mSensorListener = NULL;
+            }
+        }
         return ret;
     }
 
@@ -208,13 +216,12 @@ namespace android{
         status_t res = NO_ERROR;
 
         AutoMutex lock(mlock);
-
         int preview_fps = mJzParameters->getCameraParameters().getPreviewFrameRate();
-        mRawPreviewWidth = mRawPreviewHeight = 0;
-        mPreviewAfter = 0;
 
         if (window != NULL) {
             res = window->set_usage(window,GRALLOC_USAGE_SW_WRITE_OFTEN);
+            if (mPreviewEnabled)
+                NegotiatePreviewFormat(window);
             if (res == NO_ERROR) {
                 mPreviewAfter = 1000000000LL / preview_fps;
             } else {
@@ -225,12 +232,6 @@ namespace android{
             }
         }
         mPreviewWindow = window;
-
-        if ( ((camera_state == RUN_PREVIEW) || (camera_state == START_PREVIEW))  && window != 0) {
-            ALOGE_IF(DEBUG_HAL1,"%s: Negotiating preview format",__FUNCTION__);
-            NegotiatePreviewFormat(window);
-        }
-        ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
         return res;
     }
 
@@ -240,13 +241,11 @@ namespace android{
                                   camera_request_memory get_memory,
                                   void* user) {
         AutoMutex lock(mlock);
-
         mnotify_cb = notify_cb;
         mdata_cb = data_cb;
         mdata_cb_timestamp = data_cb_timestamp;
         mget_memory = get_memory;
         mcamera_interface = user;
-
         return;
     }
 
@@ -265,10 +264,24 @@ namespace android{
             mMesgEnabled |= msg_type;
         }
 
+        valstr = mJzParameters->getCameraParameters().get(CameraParameters::KEY_RECORDING_HINT);
         if ((msg_type & CAMERA_MSG_VIDEO_FRAME) &&
             (mMesgEnabled ^ old) & CAMERA_MSG_VIDEO_FRAME && mVideoRecEnabled) {
-            ALOGE_IF(DEBUG_HAL1,"You must alloc preview buffer for video recording ");
+            ALOGV("You must alloc preview buffer for video recording ");
+        } else if ((msg_type & CAMERA_MSG_VIDEO_FRAME)
+                   && strcmp("true",valstr)) {
+            ALOGV("%s: reset preview because format is not yuv420b",__FUNCTION__);
+            mJzParameters->getCameraParameters().set(CameraParameters::KEY_RECORDING_HINT,"true");
+            //mHal1SignalThread->SetSignal(SIGNAL_RESET_PREVIEW);
         }
+    }
+
+    void CameraHal1::resetPreview(void) {
+
+        ALOGV("%s: ",__FUNCTION__);
+        stopPreview();
+        mJzParameters->setParameters(mJzParameters->getCameraParameters().flatten());
+        startPreview();
     }
 
     void CameraHal1::disableMsgType(int32_t msg_type) {
@@ -282,7 +295,7 @@ namespace android{
 
         if ((msg_type & CAMERA_MSG_VIDEO_FRAME) &&
             (mMesgEnabled^old) & CAMERA_MSG_VIDEO_FRAME && mVideoRecEnabled) {
-            ALOGE_IF(DEBUG_HAL1,"You must alloc preview buffer for video recording.");
+            ALOGV("You must alloc preview buffer for video recording.");
         }
 
         return;
@@ -294,163 +307,102 @@ namespace android{
         return enable;
     }
 
-	status_t CameraHal1::startPreview() {
+    status_t CameraHal1::startPreview() {
 
-		ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
-
-		status_t res = NO_ERROR;
-		camera_state_lock.lock();
-		if ( camera_state == START_PREVIEW || camera_state == RUN_PREVIEW )
-            {
-                camera_state_lock.unlock();
-                ALOGE("preview started... state:%d", camera_state);
-                return NO_ERROR;
-            }
-		camera_state_lock.unlock();
-
-		getWorkThread()->stopThread();
-
-		camera_state_lock.lock();
-		camera_state = START_PREVIEW;
-		camera_state_lock.unlock();
-
-		res = getWorkThread()->startThread(false);
-        if (res != NO_ERROR) {
-            ALOGE("%s: start preview thread error",__FUNCTION__);
-		    camera_state = CAMERA_ERROR;
-		    return UNKNOWN_ERROR;
-        }
-
-        return NO_ERROR;
-	}
-
-
-    status_t CameraHal1::readyToPreview() {
-
-        ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
         status_t res = NO_ERROR;
-        const char* is_video = NULL;
-        bool isSupportVideoSnapShort = false;                    
-        int width = 0, height = 0;
-        const char* format = NULL;
 
-        int64_t startTime = 0;
-        int64_t workTime= 0;
-
-
+        AutoMutex lock(mlock);
         res = mDevice->connectDevice(mcamera_id);
-        if (res != NO_ERROR) {
-            return UNKNOWN_ERROR;
-        }
+        mDevice->getPreviewSize(&mRawPreviewWidth, &mRawPreviewHeight);
+        mJzParameters->resetSizeChanged();
 
-        isSupportVideoSnapShort = (strcmp(mJzParameters->getCameraParameters()
-                                          .get(CameraParameters::KEY_VIDEO_SNAPSHOT_SUPPORTED),
-                                          "true") == 0);
-        is_video = mJzParameters->getCameraParameters().get(CameraParameters::KEY_RECORDING_HINT);
-        if ((is_video != NULL) && (strcmp(is_video, "true") == 0)) {
-            //mJzParameters->getCameraParameters().getVideoSize(&width, &height);
-            mJzParameters->getCameraParameters().getPreviewSize(&width, &height);
-            initVideoHeap(width, height);
+        if (res == NO_ERROR) {
+            initVideoHeap(mRawPreviewWidth, mRawPreviewHeight);
+            initPreviewHeap();
+            res = mDevice->allocateStream(PREVIEW_BUFFER,mget_memory,mRawPreviewWidth, mRawPreviewHeight,
+                                          mDevice->getPreviewFormat());
         } else {
-            mJzParameters->getCameraParameters().getPreviewSize(&width, &height);
-            initPreviewHeap(width, height);
+            ALOGE("%s: connect device error",__FUNCTION__);
+            mPreviewEnabled = false;
         }
 
-        ALOGE_IF(DEBUG_HAL1,"%s: isVideoRecEnabled = %s", __FUNCTION__,  
-                 mVideoRecEnabled ? "true" : "false");
-        ALOGE_IF(DEBUG_HAL1,"mRawPrivewWidth = %d, mRawPrivewHeiht = %d", 
-                 mRawPreviewWidth, mRawPreviewHeight);
-
-        format = mJzParameters->getCameraParameters().getPreviewFormat();
-
-        if (format == NULL) {
-            ALOGE("cann't get the preiview format!");
-            return  UNKNOWN_ERROR;
+        if (res == NO_ERROR) {
+            res = mDevice->startDevice();
+        } else {
+            ALOGE("%s: allocate preview stream error",__FUNCTION__);
+            mPreviewEnabled = false;
         }
 
-        ALOGE_IF(DEBUG_HAL1,"allocateStream preview_buffer");
-        res = mDevice->allocateStream(PREVIEW_BUFFER,mget_memory,width,height,
-                                      mDevice->getPreviewFormat());
-        if (res != NO_ERROR) {
-            ALOGE("allcate preview mem failed");;
-            return res;
-        }
-
-        ALOGE_IF(DEBUG_HAL1,"startDevice");
-	  
-        startTime = systemTime(SYSTEM_TIME_MONOTONIC);
-        res = mDevice->startDevice();
-        if (res != NO_ERROR) {
-            ALOGE("startDevice failed\n");
-            mDevice->freeStream(PREVIEW_BUFFER);
-            return UNKNOWN_ERROR;
-        }
-         
-        if (mPreviewWindow != 0) {
-            ALOGE_IF(DEBUG_HAL1,"%s: Negotiating preview format",__FUNCTION__);
+        if (res == NO_ERROR) {
             NegotiatePreviewFormat(mPreviewWindow);
-        }
-
-        mDevice->sendCommand(FOCUS_INIT);
-
-        if (mDevice->usePmem() == false) {
-            x2d_fd = open (X2D_NAME, O_RDWR);
-            if (x2d_fd < 0) {
-                ALOGE("%s: open %s error, %s",
-                      __FUNCTION__, X2D_NAME, strerror(errno));
-                return UNKNOWN_ERROR;
+            res = getWorkThread()->sendMesg(WorkThread::THREAD_READY);
+            AutoMutex lock(cmd_lock);
+            while (!mreceived_cmd) {
+                mreceivedCmdCondition.wait(cmd_lock);
             }
-
-            if (open_ipu_dev() < 0) {
-                ALOGE("%s: open ipu dev error",__FUNCTION__);
-                return UNKNOWN_ERROR;
-            }
+            mreceived_cmd = false;
         } else {
-            if (open_ipu_dev() < 0) {
-                ALOGE("%s: open ipu dev error",__FUNCTION__);
-                return UNKNOWN_ERROR;
-            }
+            ALOGE("%s: start device error",__FUNCTION__);
+            mDevice->freeStream(PREVIEW_BUFFER);
+            mPreviewEnabled = false;
         }
 
-        workTime = systemTime(SYSTEM_TIME_MONOTONIC) - startTime;
+        if (res == NO_ERROR) {
+            mPreviewEnabled = true;
+            mDevice->sendCommand(FOCUS_INIT);
+        } else {
+            ALOGE("%s: start preview thread error",__FUNCTION__);
+            getWorkThread()->sendMesg(WorkThread::THREAD_IDLE);
+            mDevice->stopDevice();
+            mDevice->freeStream(PREVIEW_BUFFER);
+            mPreviewEnabled = false;
+        }
 
-        ALOGE_IF(DEBUG_HAL1,"readyToPreview use time : %lld us", workTime/1000); 
-     
-        return NO_ERROR;
+        return mPreviewEnabled ? NO_ERROR : INVALID_OPERATION;
     }
 
-	status_t CameraHal1::freePreview() {
-
-		ALOGE_IF(DEBUG_HAL1,"freePreview");
-
-		status_t ret = NO_ERROR;
-		
-		ret = mDevice->stopDevice();
-		mPreviewIndex = 0;
-
-		isSoftFaceDetectStart = false;
-        mDevice->freeStream(PREVIEW_BUFFER);
-
-		if (mDevice->usePmem() == false) {
-			if (x2d_fd > 0)
-				close(x2d_fd);
-			x2d_fd = -1;
-			close_ipu_dev();
-		} else {
-			close_ipu_dev();
-		}
-
-		return NO_ERROR;
-	}
-
     void CameraHal1::stopPreview() {
-        ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
-        getWorkThread()->stopThread();
+
+        status_t ret = NO_ERROR;
+        if (mPreviewEnabled) {
+            AutoMutex lock(cmd_lock);
+            getWorkThread()->sendMesg(WorkThread::THREAD_IDLE);
+            while (!mreceived_cmd) {
+                mreceivedCmdCondition.wait(cmd_lock);
+            }
+            mreceived_cmd = false;
+        }
+        ret = mDevice->stopDevice();
+        ALOGV("%s",__FUNCTION__);
+        if (mPreviewHeap) {
+            mPreviewFrameSize = 0;
+            mPreviewIndex = 0;
+            mPreviewWidth = 0;
+            mPreviewHeight = 0;
+            dmmu_unmap_memory((uint8_t*)mPreviewHeap->data,mPreviewHeap->size);
+            mPreviewHeap->release(mPreviewHeap);
+            mPreviewHeap = NULL;
+        }
+
+        AutoMutex lock(mlock);
+        isSoftFaceDetectStart = false;
+        if ((ret == NO_ERROR) && mPreviewEnabled) {
+            mPreviewEnabled = false;
+            mDevice->freeStream(PREVIEW_BUFFER);
+        }
+
         return;
     }
 
     int CameraHal1::isPreviewEnabled() {
-        return camera_state == RUN_PREVIEW || camera_state == START_PREVIEW;
+
+        int enable = 0;
+        {
+            AutoMutex lock(mlock);
+            enable = (mPreviewEnabled != false);
+        }
+
+        return enable;
     }
 
     status_t CameraHal1::storeMetaDataInBuffers(int enable) {
@@ -459,37 +411,131 @@ namespace android{
 
     status_t CameraHal1::startRecording() {
 
-        ALOGE_IF(1,"Enter %s mVideoRecEnable=%s",__FUNCTION__,mVideoRecEnabled?"true":"false");
+        mtotaltime=0;
+        mtotalnum=0;
+        ALOGV("Enter %s mVideoRecEnable=%s",__FUNCTION__,mVideoRecEnabled?"true":"false");
         if (mVideoRecEnabled == false) {
             AutoMutex lock(mlock);
+#ifdef START_CAMERA_COLOR_CONVET_THREAD
+        ccc->mCC_SMPThread->startthread();
+#endif
             mVideoRecEnabled = true;
             mRecordingindex = 0;
-            ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
+            if (mRecordingHeap == NULL) {
+                initVideoHeap(mRawPreviewWidth, mRawPreviewHeight);
+            }
         }
 
         return NO_ERROR;
     }
 
-    void CameraHal1::stopRecording() {
+    void CameraHal1::completeRecordingVideo() {
 
-
-        ALOGE_IF(DEBUG_HAL1,"Enter %s mVideoRecEnable=%s",
-                 __FUNCTION__,mVideoRecEnabled?"true":"false");
-
-        if (mVideoRecEnabled) {
-            getWorkThread()->threadResume();
-            AutoMutex lock(mlock);
-            mVideoRecEnabled = false;
-            mRecordingindex = 0;
-            ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
+        if (mRecordingDataQueue.isEmpty()) {
+            ALOGE("%s: recording queue is empty",__FUNCTION__);
+            return;
         }
 
+        camera_memory_t* recordingData = NULL;
+        camera_memory_t* tmpHeap = NULL;
+        do {
+
+            if (!mVideoRecEnabled) {
+                break;
+            }
+
+            {
+                AutoMutex lock(recordingDataQueueLock);
+                recordingData = mRecordingDataQueue[0];
+                mRecordingDataQueue.erase(mRecordingDataQueue.begin());
+            }
+
+            if (recordingData != NULL) {
+                if ((mRecordingHeap != NULL) && (mRecordingHeap->data != NULL) && ccc) {
+                    uint8_t* dest = (uint8_t*)((int)(mRecordingHeap->data)
+                                               + mRecordingFrameSize * mRecordingindex);
+                    if (mzoomVal != 0) {
+                        if (mget_memory != NULL) {
+                            tmpHeap = mget_memory(-1, getCurrentFrameSize(), 1, NULL);
+                            if (tmpHeap != NULL) {
+                                dmmu_map_memory((uint8_t*)recordingData->data,recordingData->size);
+                                do_zoom((uint8_t*)tmpHeap->data, (uint8_t*)recordingData->data);
+                                dmmu_unmap_memory((uint8_t*)recordingData->data,recordingData->size);
+                                recordingData->release(recordingData);
+                                recordingData = tmpHeap;
+                            }
+                        }
+                    }
+#ifdef ENCODE_BY_HARDWARE
+                    ccc->cimvyuy_to_tile420((uint8_t*)recordingData->data,
+                                            mCurrentFrame->width,
+                                            mCurrentFrame->height,
+                                            dest,
+                                            0,
+                                            mCurrentFrame->height/16);
+#else
+                    ccc->yuyv_to_yuv420p(dest,
+                                         mCurrentFrame->width,
+                                         mCurrentFrame->height,
+                                         (uint8_t*)recordingData->data,
+                                         mCurrentFrame->width*2,
+                                         mCurrentFrame->width,
+                                         mCurrentFrame->height);
+#endif
+                    recordingData->release(recordingData);
+                    recordingData = NULL;
+                    int64_t timestamp = systemTime(SYSTEM_TIME_MONOTONIC);
+                    mdata_cb_timestamp(timestamp,CAMERA_MSG_VIDEO_FRAME,
+                                       mRecordingHeap, mRecordingindex, mcamera_interface);
+                    mRecordingindex = (mRecordingindex+1)%RECORDING_BUFFER_NUM;
+                }
+            }
+        } while (!mRecordingDataQueue.isEmpty());
+        return;
+    }
+
+    void CameraHal1::stopRecording() {
+
+        ALOGV("Enter %s mVideoRecEnable=%s",
+              __FUNCTION__,mVideoRecEnabled?"true":"false");
+
+        if (mVideoRecEnabled) {
+            {
+                AutoMutex lock(mlock);
+                getWorkThread()->threadResume();
+                mVideoRecEnabled = false;
+#ifdef START_CAMERA_COLOR_CONVET_THREAD
+        ccc->mCC_SMPThread->stopthread();
+#endif
+#ifdef CONVERTER_PMON
+        ALOGV("average convert time = %d, num=%d",mtotaltime/mtotalnum,mtotalnum);
+#endif
+                mRecordingindex = 0;
+            }
+
+            if (mRecordingHeap) {
+                dmmu_unmap_memory((uint8_t*)mRecordingHeap->data,mRecordingHeap->size);
+                mRecordingFrameSize = 0;
+                mRecordingHeap->release(mRecordingHeap);
+                mRecordingHeap = NULL;
+            }
+
+            {
+                AutoMutex lock(recordingDataQueueLock);
+                for (unsigned i = 0; i < mRecordingDataQueue.size(); i++) {
+                    camera_memory_t* recordingData = mRecordingDataQueue[i];
+                    recordingData->release(recordingData);
+                    recordingData = NULL;
+                }
+                mRecordingDataQueue.clear();
+            }
+        }
     }
 
     int CameraHal1::isRecordingEnabled() {
 
-        ALOGE_IF(DEBUG_HAL1,"Enter %s mVideoRecEnable=%s",
-                 __FUNCTION__,mVideoRecEnabled?"true":"false");
+        ALOGV("Enter %s mVideoRecEnable=%s",
+              __FUNCTION__,mVideoRecEnabled?"true":"false");
         int enabled;
         {
             AutoMutex lock(mlock);
@@ -504,174 +550,280 @@ namespace android{
     }
 
     status_t CameraHal1::setAutoFocus() {
-
         status_t ret = NO_ERROR;
-
         AutoMutex lock(mlock);
         mDevice->sendCommand(PAUSE_FACE_DETECT);
-        if (mFocusThread.get() != NULL)
-            ret = mFocusThread.get()->startThread();
+        if (getAutoFocusThread() != NULL) {
+            getAutoFocusThread()->startThread();
+        }
         return ret;
     }
 
     status_t CameraHal1::cancelAutoFocus() {
-
         status_t ret = NO_ERROR;
-          
-        if (mFocusThread.get() != NULL)
-            ret = mFocusThread.get()->stopThread();
+        if (getAutoFocusThread() != NULL) {
+            ret = getAutoFocusThread()->stopThread();
+        }
         return ret;
     }
 
     bool CameraHal1::startAutoFocus() {
-
         status_t ret = NO_ERROR;
         if (mMesgEnabled & CAMERA_MSG_FOCUS) {
-
             ret = mDevice->sendCommand(START_FOCUS);
-            if (ret != NO_ERROR)
-                {
-                    if (mMesgEnabled & CAMERA_MSG_FOCUS)
-                        mnotify_cb(CAMERA_MSG_FOCUS,0,0,mcamera_interface);
-                    if (mMesgEnabled & CAMERA_MSG_FOCUS_MOVE)
-                        {
-                            int focus_state = mDevice->sendCommand(GET_FOCUS_STATUS);
-                            if (focus_state == NO_ERROR)
-                                mnotify_cb(CAMERA_MSG_FOCUS_MOVE, false, 0, mcamera_interface);
-                            else
-                                mnotify_cb(CAMERA_MSG_FOCUS_MOVE, false, 0, mcamera_interface);
-                        }
-                } else  if (mMesgEnabled & CAMERA_MSG_FOCUS)                    
+            if (ret == NO_ERROR) {
+                if (mMesgEnabled & CAMERA_MSG_FOCUS)
+                    mnotify_cb(CAMERA_MSG_FOCUS,0,0,mcamera_interface);
+                if (mMesgEnabled & CAMERA_MSG_FOCUS_MOVE) {
+                    int focus_state = mDevice->sendCommand(GET_FOCUS_STATUS);
+                    if (focus_state == NO_ERROR)
+                        mnotify_cb(CAMERA_MSG_FOCUS_MOVE, false, 0, mcamera_interface);
+                    else
+                        mnotify_cb(CAMERA_MSG_FOCUS_MOVE, false, 0, mcamera_interface);
+                }
+            } else if (mMesgEnabled & CAMERA_MSG_FOCUS)
                 mnotify_cb(CAMERA_MSG_FOCUS,1, 0, mcamera_interface);
         }
 
-        ALOGE_IF(DEBUG_HAL1,"AutoFocus thread exit");
+        ALOGV("AutoFocus thread exit");
         return false;
     }
 
-	status_t CameraHal1::readyToCapture() {
+    status_t CameraHal1::takePicture() {
+        mJzParameters->getCameraParameters().getPictureSize(&mPicturewidth, &mPictureheight);
+        if (mDevice->getSupportPreviewDataCapture()) {
+            return do_takePictureWithPreview();
+        } else {
+            return do_takePicture();
+        }
+    }
 
-		ALOGE_IF(DEBUG_HAL1,"readyToCapture");
-		status_t res = NO_ERROR;
-		int width = 0, height = 0;
+    status_t CameraHal1::do_takePictureWithPreview(void) {
+        if (mPreviewEnabled) {
+            AutoMutex lock(mlock);
+            mDevice->sendCommand(INIT_TAKE_PICTURE);
+            mTakingPicture = true;
+        }
+        return mTakingPicture? NO_ERROR : INVALID_OPERATION;
+    }
 
-		if (mJzParameters->getPropertyPictureSize(&width, &height) < 0) {	
-			mJzParameters->getCameraParameters().getPictureSize(&width, &height);
-		}
+    status_t CameraHal1::do_takePicture(void) {
+        const char* str = mJzParameters->getCameraParameters()
+            .get(CameraParameters::KEY_VIDEO_SNAPSHOT_SUPPORTED);
 
-		res = mDevice->allocateStream(CAPTURE_BUFFER,mget_memory,width, height,
-                                      mDevice->getCaptureFormat());
-		if (res != NO_ERROR) {
-			ALOGE("alloca capture buffer fail");
-			return res;
-		}
+        if (mVideoRecEnabled && (strncmp(str, "true",4) == 0)) {
+            AutoMutex lock(mlock);
+            mTakingPicture = true;
+            return NO_ERROR;
+        }
+        mHal1SignalThread->SetSignal(SIGNAL_TAKE_PICTURE);
+        return NO_ERROR;
+    }
 
-		res = mDevice->sendCommand(TAKE_PICTURE, width, height);
-		if (res != NO_ERROR) {
-			ALOGE("sendCommand(TAKE_PICTURE) failed!");
-			return res;
-		}
+    status_t CameraHal1::completeTakePicture(void) {
 
-		return NO_ERROR;
-	}
+        if (mPreviewEnabled) {
+            AutoMutex lock(cmd_lock);
+            getWorkThread()->sendMesg(WorkThread::THREAD_IDLE);
+            while (!mreceived_cmd) {
+                mreceivedCmdCondition.wait(cmd_lock);
+            }
+            mreceived_cmd = false;
+            mPreviewEnabled = false;
+        }
 
-	status_t CameraHal1::takePicture() {
+        camera_memory_t* takingPictureHeap = NULL;
+        {
+            AutoMutex lock(mlock);
+            mDevice->sendCommand(STOP_PICTURE);
+            mDevice->stopDevice();
+            mDevice->initTakePicture(mPicturewidth,mPictureheight,mget_memory);
+            mCurrentFrame =
+                (CameraYUVMeta*)(mDevice->sendCommand(TAKE_PICTURE, mPicturewidth, mPictureheight));
 
-		ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
-		status_t res = NO_ERROR;
-		camera_state_lock.lock();
-		if ( camera_state == START_CAPTURE || camera_state == RUN_CAPTURE ) {
-			camera_state_lock.unlock();
-			return NO_ERROR;
-		}
+            if (mCurrentFrame == NULL) {
+                mDevice->deInitTakePicture();
+                mHal1SignalThread->SetSignal(SIGNAL_RESET_PREVIEW);
+                ALOGE("%s: take picture error",__FUNCTION__);
+                return NO_ERROR;
+            }
 
-		camera_state_lock.unlock();
+            int size = getCurrentFrameSize();
 
-		stopPreview();
-		camera_state_lock.lock();
-		camera_state = START_CAPTURE;
-		camera_state_lock.unlock();
+            if ((mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) && ccc) {
+                ccc->cimyuv420b_to_tile420(mCurrentFrame); //1- 4ms
+            }
 
-		res = getWorkThread()->startThread(true);
-		if (res != NO_ERROR) {
-			ALOGE("%s: start preview thread error",__FUNCTION__);
-			return UNKNOWN_ERROR;
-		}
+            takingPictureHeap = mget_memory(-1, size,1, NULL);
+            memset(takingPictureHeap->data, 0, size);
+            dmmu_map_memory((uint8_t*)takingPictureHeap->data,takingPictureHeap->size);
+            status_t ret = NO_ERROR;
 
-		return NO_ERROR;
+            if(mDevice->getSupportCaptureIncrease() && mCurrentFrame->width > 1600){
+                if(mCurrentFrame->width > 2048){
+                    ret = ipu_zoomIn_scale((uint8_t*)takingPictureHeap->data,
+                                           mCurrentFrame->width >> 1, mCurrentFrame->height,
+                                           (uint8_t*)mCurrentFrame->yAddr, 800, 1200,
+                                           mCurrentFrame->format, 2, 800);
+                    ret = ipu_zoomIn_scale((uint8_t*)((unsigned int)takingPictureHeap->data + mCurrentFrame->width),
+                                           mCurrentFrame->width >> 1, mCurrentFrame->height,
+                                           (uint8_t*)mCurrentFrame->yAddr + 1600, 800, 1200,
+                                           mCurrentFrame->format, 2, 800);
+                }else{
+                    ret = ipu_zoomIn_scale((uint8_t*)takingPictureHeap->data,
+                                           mCurrentFrame->width, mCurrentFrame->height,
+                                           (uint8_t*)mCurrentFrame->yAddr, 1600, 1200,
+                                           mCurrentFrame->format, 0, 1600);
+                }
+                if (ret != NO_ERROR)
+                    ALOGE("%s: ipu up scale error",__FUNCTION__);
+                if(mzoomVal != 0){
+                    memcpy((uint8_t*)mCurrentFrame->yAddr, takingPictureHeap->data, size);
+                    do_zoom((uint8_t*)takingPictureHeap->data,(uint8_t*)mCurrentFrame->yAddr);
+                }
+            }else {
+                if(mzoomVal != 0)
+                    do_zoom((uint8_t*)takingPictureHeap->data,(uint8_t*)mCurrentFrame->yAddr);
+                else
+                    memcpy(takingPictureHeap->data,(uint8_t*)mCurrentFrame->yAddr,size);
+            }
+
+#if 0
+            FILE *file = NULL;
+            void * vaddr = takingPictureHeap->data;
+
+#define MY_FILE "/data/jczheng/456.txt"
+            ALOGE("yAddr = 0x%p, size = %d, format = 0x%x\n", vaddr, size, mCurrentFrame->format);
+
+            if(file == NULL)
+                file = fopen(MY_FILE, "w+");
+            if (file == NULL) {
+                ALOGE("errno = %d\n", errno);
+                ALOGV("open My");
+                return false;
+            }
+            ret = fwrite((void *)vaddr, size, 1, file);
+            if(ret < 0)
+                ALOGE("<0>""file write failed/n");
+            if(file != NULL)
+                fclose(file);
+#endif
+            {
+                AutoMutex lock(mcapture_lock);
+                mListCaptureHeap.push_back(takingPictureHeap);
+            }
+        }
+
+        if (mMesgEnabled & CAMERA_MSG_SHUTTER) {
+            mnotify_cb(CAMERA_MSG_SHUTTER, 0, 0, mcamera_interface);
+        }
+
+        if (mMesgEnabled & CAMERA_MSG_RAW_IMAGE_NOTIFY) {
+            mnotify_cb(CAMERA_MSG_RAW_IMAGE_NOTIFY, 0, 0, mcamera_interface);
+        }
+
+        if ((takingPictureHeap != NULL) && (mMesgEnabled & CAMERA_MSG_RAW_IMAGE)) {
+            mdata_cb(CAMERA_MSG_RAW_IMAGE,takingPictureHeap, 0, NULL, mcamera_interface);
+        }
+
+        if ((takingPictureHeap != NULL) && (mMesgEnabled & CAMERA_MSG_POSTVIEW_FRAME)) {
+            mdata_cb(CAMERA_MSG_RAW_IMAGE,takingPictureHeap, 0, NULL, mcamera_interface);
+        }
+
+        if (mMesgEnabled & CAMERA_MSG_COMPRESSED_IMAGE) {
+            ALOGV("%s start compress picture",__FUNCTION__);
+            mWorkerQueue->schedule(new PostJpegUnit(this));
+        }
+
+        return NO_ERROR;
     }
 
     status_t CameraHal1::cancelPicture() {
-        ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
-        getWorkThread()->stopThread();
+
+        {
+            AutoMutex lock(mlock);
+            mDevice->sendCommand(STOP_PICTURE);
+            mTakingPicture = false;
+        }
+
+        AutoMutex lock(mcapture_lock);
+        if (!mListCaptureHeap.empty()) {
+            List<camera_memory_t*>::iterator it = mListCaptureHeap.begin();
+            for (;it != mListCaptureHeap.end(); ++it) {
+                camera_memory_t* captureHeap = *it;
+                if (captureHeap != NULL) {
+                    dmmu_unmap_memory((uint8_t*)captureHeap->data,captureHeap->size);
+                    captureHeap->release(captureHeap);
+                    captureHeap = NULL;
+                }
+            }
+            mListCaptureHeap.clear();
+        }
+        ALOGV("%s: line=%d",__FUNCTION__,__LINE__);
         return NO_ERROR;
     }
 
     status_t CameraHal1::setParameters(const char* parms) {
-
         status_t res = NO_ERROR;
-          
         AutoMutex lock(mlock);
         String8 str_param(parms);
         res = mJzParameters->setParameters(str_param);
-          
         return res;
     }
 
     static char noParams = '\0';
     char* CameraHal1::getParameters() {
-
         String8 params(mJzParameters->getCameraParameters().flatten());
-        char* ret_str = reinterpret_cast<char*>(malloc(sizeof(char) * params.length()+1));
+        char* ret_str = (char*)malloc(sizeof(char) * params.length()+1);
         memset(ret_str, 0, params.length()+1);
-        if (ret_str != NULL)
-            {
-                memcpy(ret_str, params.string(), params.length()+1);
-                return ret_str;
-            }
+        if (ret_str != NULL) {
+            memcpy(ret_str, params.string(), params.length()+1);
+            return ret_str;
+        }
+        ALOGE("%s: getParameters error",__FUNCTION__);
         return &noParams;
     }
 
     void CameraHal1::putParameters(char* params) {
-
-        if (NULL != params && params != &noParams)
-            {
-                free(params);
-                params = NULL;
-            }
+        if (NULL != params && params != &noParams) {
+            free(params);
+            params = NULL;
+        }
     }
 
     status_t CameraHal1::sendCommand(int32_t cmd, int32_t arg1, int32_t arg2) {
-
         status_t res = NO_ERROR;
-
         AutoMutex lock(mlock);
-
         switch(cmd)
             {
             case CAMERA_CMD_ENABLE_FOCUS_MOVE_MSG:
                 bool enable = static_cast<bool>(arg1);
                 AutoMutex lock(mlock);
                 if (enable) {
-
                     mMesgEnabled |= CAMERA_MSG_FOCUS_MOVE;
                 } else {
                     mMesgEnabled &= ~CAMERA_MSG_FOCUS_MOVE;
                 }
-                return res;                    
+                return res;
             }
-          
-        if (camera_state != RUN_PREVIEW) {
+
+        if (mPreviewEnabled == false) {
             ALOGE("%s: Preview is not running",__FUNCTION__);
-            return INVALID_OPERATION;         
+            return BAD_VALUE;
         }
         switch(cmd)
             {
             case CAMERA_CMD_START_SMOOTH_ZOOM:
                 res = mDevice->sendCommand(START_ZOOM);
+                if (mMesgEnabled & CAMERA_MSG_ZOOM) {
+                    mnotify_cb(CAMERA_MSG_ZOOM,mzoomVal,1,mcamera_interface);
+                }
                 break;
             case CAMERA_CMD_STOP_SMOOTH_ZOOM:
                 res = mDevice->sendCommand(STOP_ZOOM);
+                if (mMesgEnabled & CAMERA_MSG_ZOOM) {
+                    mnotify_cb(CAMERA_MSG_ZOOM,mzoomVal,0,mcamera_interface);
+                }
                 break;
             case CAMERA_CMD_START_FACE_DETECTION:
                 res = softFaceDetectStart(arg1);
@@ -684,25 +836,70 @@ namespace android{
             default:
                 break;
             }
-        ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
         return res;
+    }
+
+    void CameraHal1::do_zoom(uint8_t* dest, uint8_t* src) {
+
+        status_t ret = NO_ERROR;
+        int bytes_per_pixel = 2;
+        unsigned int cut_width = num2even(mCurrentFrame->width * 100 / mzoomRadio);
+        unsigned int cut_height = num2even(mCurrentFrame->height * 100 / mzoomRadio);
+        int cropLeft = num2even((mCurrentFrame->width - cut_width) / 2);
+        cropLeft = (cropLeft < 0) ? 0 : cropLeft;
+        int cropTop = num2even((mCurrentFrame->height - cut_height) / 2);
+        cropTop = (cropTop < 0) ? 0 : cropTop;
+        int offset = (cropTop * mCurrentFrame->width + cropLeft) * bytes_per_pixel;
+        offset = (offset < 0) ? 0 : offset;
+        int reviseval = 0;
+
+        ALOGV("mzoomVal = %d, cut_width = %d, cut_height = %d, cropLeft =%d, cropTop = %d, offset = %d, mzoomRadio: %d",
+              mzoomVal, cut_width, cut_height, cropLeft, cropTop, offset, mzoomRadio);
+
+        if(mCurrentFrame->width > 2048){
+            ret = ipu_zoomIn_scale(dest,
+                                   mCurrentFrame->width >> 1, mCurrentFrame->height,
+                                   (uint8_t*)(src+offset),
+                                   cut_width >> 1, cut_height,
+                                   mCurrentFrame->format, 2, mCurrentFrame->width >> 1);
+            if(cropLeft == 776)
+                reviseval = 2;
+            else
+                reviseval = 0;
+            ret = ipu_zoomIn_scale((uint8_t*)((unsigned int)dest + mCurrentFrame->width),
+                                   mCurrentFrame->width >> 1, mCurrentFrame->height,
+                                   (uint8_t*)(src+offset + cut_width + reviseval),
+                                   cut_width >> 1, cut_height,
+                                   mCurrentFrame->format, 2, mCurrentFrame->width >> 1);
+        }else{
+            ret = ipu_zoomIn_scale(dest,
+                                   mCurrentFrame->width, mCurrentFrame->height,
+                                   (uint8_t*)(src+offset),
+                                   cut_width, cut_height,
+                                   mCurrentFrame->format, 0, mCurrentFrame->width);
+        }
+        if (ret != NO_ERROR)
+            ALOGE("%s: ipu up scale error",__FUNCTION__);
     }
 
     void CameraHal1::releaseCamera() {
 
-        stopPreview();
-        stopRecording();
-        cancelPicture();
-        cancelAutoFocus();
-          
+        if (mWorkerQueue != NULL) {
+            delete mWorkerQueue;
+            mWorkerQueue = NULL;
+        }
+
+        getWorkThread()->stopThread();
+
         AutoMutex lock(mlock);
+
         mMesgEnabled = 0;
         mnotify_cb = NULL;
         mdata_cb = NULL;
         mdata_cb_timestamp = NULL;
         mget_memory = NULL;
-
-        ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
+        mModuleOpened = false;
+        ALOGV("%s: line=%d",__FUNCTION__,__LINE__);
         return ;
     }
 
@@ -722,8 +919,16 @@ namespace android{
         snprintf(buffer, 256, "mPreviewAfter=%lld,",mPreviewAfter);
         msg.append(buffer);
         memset(buffer, 0, 256);
-        snprintf(buffer,256, "mPreviewWidth=%d,mPreviewHeight=%d,",
+        snprintf(buffer,256, "mRawPreviewWidth=%d,mRawPreviewHeight=%d,",
                  mRawPreviewWidth, mRawPreviewHeight);
+        msg.append(buffer);
+        memset(buffer, 0, 256);
+        snprintf(buffer,256, "mPreviewWidth=%d,mPreviewHeight=%d,",
+                 mPreviewWidth, mPreviewHeight);
+        msg.append(buffer);
+        memset(buffer, 0, 256);
+        snprintf(buffer,256, "mPreviewWinWidth=%d,mPreviewWinHeight=%d,",
+                 mPreviewWinWidth, mPreviewWinHeight);
         msg.append(buffer);
         memset(buffer, 0, 256);
         snprintf(buffer, 256, "mVideoRecordingEnable=%s,",mVideoRecEnabled?"true":"false");
@@ -731,342 +936,309 @@ namespace android{
         msg.append(mJzParameters->getCameraParameters().flatten());
         write(fd, msg.string(),msg.length());
 
-        ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
+        ALOGV("%s: line=%d",__FUNCTION__,__LINE__);
         return NO_ERROR;
     }
 
-    int CameraHal1::deviceClose(void) {		 
+    int CameraHal1::deviceClose(void) {
 
-        releaseCamera();
+        int count = 100;
+        if (mHal1SignalThread != NULL) {
+            mHal1SignalThread->release();
+            while(!mHal1SignalThread->IsTerminated()) {
+                usleep(SIG_WAITING_TICK);
+                if (--count < 0) {
+                    count = 100;
+                    break;
+                }
+            }
+            mHal1SignalThread.clear();
+            mHal1SignalThread = NULL;
+        }
+
+        if (mHal1SignalRecordingVideo != NULL) {
+            mHal1SignalRecordingVideo->release();
+            while(!mHal1SignalRecordingVideo->IsTerminated()) {
+                usleep(SIG_WAITING_TICK);
+                if (--count < 0) {
+                    count = 100;
+                    break;
+                }
+            }
+            mHal1SignalRecordingVideo.clear();
+            mHal1SignalRecordingVideo = NULL;
+        }
+
+        if (mSensorListener.get()) {
+            mSensorListener->disableSensor(SensorListener::SENSOR_ORIENTATION);
+            mSensorListener.clear();
+            mSensorListener = NULL;
+        }
         mDevice->disConnectDevice();
-		  
-        if (mPreviewHeap) {
-            struct dmmu_mem_info dmmu_info;
-            memset(&dmmu_info, 0, sizeof(struct dmmu_mem_info));
-            mPreviewFrameSize = 0;
-            dmmu_info.vaddr = mPreviewHeap->data;
-            dmmu_info.size = mPreviewHeap->size;
-            dmmu_unmap_user_memory(&dmmu_info);
-            mPreviewHeap->release(mPreviewHeap);
-            mPreviewHeap = NULL;
-        }
-		  
-        if (mRecordingHeap) {
-            struct dmmu_mem_info dmmu_info;
-            memset(&dmmu_info, 0, sizeof(struct dmmu_mem_info));
-            mRecordingFrameSize = 0;
-            dmmu_info.vaddr = mRecordingHeap->data;
-            dmmu_info.size = mRecordingHeap->size;
-            dmmu_unmap_user_memory(&dmmu_info);
-            mRecordingHeap->release(mRecordingHeap);
-            mRecordingHeap = NULL;
-        }
 
         return NO_ERROR;
     }
 
     bool CameraHal1::NegotiatePreviewFormat(struct preview_stream_ops* win) {
 
-        int pw = 0, ph = 0;
-        bool isRecVideo = false;
-        bool isSupportVideoSnapShort = false;
-
-        ALOGE_IF(DEBUG_HAL1,"%s: mVideoRecEnabed = %s, video hint = %s, (mMesg & video_frame) = %s",
-                 __FUNCTION__, mVideoRecEnabled?"true":"false", 
-                 mJzParameters->getCameraParameters().get(CameraParameters::KEY_RECORDING_HINT), 
-                 ((mMesgEnabled & CAMERA_MSG_VIDEO_FRAME) == CAMERA_MSG_VIDEO_FRAME) ? "true" : "false");
-
-        if ((mRawPreviewWidth == 0) || (mRawPreviewHeight == 0)) {
-            isRecVideo = (strcmp(mJzParameters->getCameraParameters()
-                                 .get(CameraParameters::KEY_RECORDING_HINT), "true") == 0);
-            if (isRecVideo){
-                //mJzParameters->getCameraParameters().getVideoSize(&pw, &ph);
-                mJzParameters->getCameraParameters().getPreviewSize(&pw, &ph);
-            } else {
-                mJzParameters->getCameraParameters().getPreviewSize(&pw, &ph);
-            }
-        } else {
-            pw = mRawPreviewWidth;
-            ph = mRawPreviewHeight;
-        }
-
-        mPreviewWinFmt = 0;
-        mPreviewWinWidth = 0;
-        mPreviewWinHeight = 0;
-
-        if (win->set_buffers_geometry(win,pw,ph,HAL_PIXEL_FORMAT_RGB_565) != NO_ERROR) {
-            ALOGE("Unable to set buffer geometry");
+        if (win == NULL) {
+            ALOGE("%s: preview win not set",__FUNCTION__);
             return false;
         }
 
+        if (mRawPreviewWidth < mPreviewWidth || mRawPreviewHeight < mPreviewHeight) {
+            mPreviewWinWidth = mRawPreviewWidth;
+            mPreviewWinHeight = mRawPreviewHeight;
+        } else {
+            mPreviewWinWidth = mPreviewWidth;
+            mPreviewWinHeight = mPreviewHeight;
+        }
+
         mPreviewWinFmt = HAL_PIXEL_FORMAT_RGB_565;
-        mPreviewWinWidth = pw;
-        mPreviewWinHeight = ph;
-
-        ALOGE_IF(DEBUG_HAL1,"%s: previewWindow: %dx%d", 
-                 __FUNCTION__, mPreviewWinWidth, mPreviewWinHeight);
-
+        if (win->set_buffers_geometry(win,mPreviewWinWidth,mPreviewWinHeight,mPreviewWinFmt) != NO_ERROR) {
+            ALOGE("Unable to set buffer geometry");
+            mPreviewWinFmt = 0;
+            mPreviewWinWidth = 0;
+            mPreviewWinHeight = 0;
+            return false;
+        }
+        ALOGV("%s: previewWindow: %dx%d,format:0x%x",
+              __FUNCTION__, mPreviewWinWidth,mPreviewWinHeight,mPreviewWinFmt);
         return true;
+    }
+
+    int CameraHal1::getCurrentFrameSize(void) {
+        int size = 0;
+
+        if ((mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)
+            || (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_SP)) {
+            size = (mCurrentFrame->width * mCurrentFrame->height) * 2;
+        } else {
+            size = (mCurrentFrame->width * mCurrentFrame->height) * 12 / 8;
+        }
+        return size;
     }
 
     void CameraHal1::initVideoHeap(int width, int height) {
 
         int video_width = width, video_height = height;
-        const char *format;
         int how_recording_big = 0;
-        struct dmmu_mem_info dmmu_info;
 
-        if (!mget_memory) {
+        if (mget_memory == NULL) {
             ALOGE("No memory allocator available");
             return;
         }
 
-        memset(&dmmu_info, 0, sizeof(struct dmmu_mem_info));
-        //mJzParameters->getCameraParameters().getVideoSize(&video_width, &video_height);
-        //mJzParameters->getCameraParameters().getPreviewSize(&video_width, &video_height);
-        format = mJzParameters->getCameraParameters().get(CameraParameters::KEY_VIDEO_FRAME_FORMAT);
-
-        if (mRawPreviewWidth != video_width || mRawPreviewHeight != video_height) {
-            mRawPreviewWidth = video_width;
-            mRawPreviewHeight = video_height;
-        }
-
-        if(strcmp(format,JZCameraParameters::PIXEL_FORMAT_JZ__YUV420T) == 0) {
-            mRecFmt = HAL_PIXEL_FORMAT_JZ_YUV_420_B;
-            how_recording_big = (video_width * video_height * 2);
-        } else if (strcmp(format,JZCameraParameters::PIXEL_FORMAT_JZ__YUV420P) == 0) {
-            mRecFmt = HAL_PIXEL_FORMAT_JZ_YUV_420_P;
-            how_recording_big = (video_width * video_height * 12/8);
-        }else if (strcmp(format ,CameraParameters::PIXEL_FORMAT_YUV422I) == 0) {
-            mRecFmt = HAL_PIXEL_FORMAT_YCbCr_422_I;
-            how_recording_big = video_width * video_height << 1;
-        } else if(strcmp(format,CameraParameters::PIXEL_FORMAT_YUV420SP) == 0) {
-            mRecFmt = HAL_PIXEL_FORMAT_YCrCb_420_SP;
-            how_recording_big = (video_width * video_height * 12/8);
-        } else if (strcmp(format, CameraParameters::PIXEL_FORMAT_YUV422SP) == 0) {
-            mRecFmt = HAL_PIXEL_FORMAT_YCbCr_422_SP;
-            how_recording_big = (video_width * video_height * 3) >> 1;
-        } else if (strcmp(format, CameraParameters::PIXEL_FORMAT_YUV420P) == 0) {
-            mRecFmt = HAL_PIXEL_FORMAT_YV12;
-            int stride = (video_width + 15) & (-16);
-            int y_size = stride * video_height;
-            int c_stride = ((stride >> 1) + 15) & (-16);
-            int c_size = c_stride * video_height >> 1;
-            int cr_offset = y_size;
-            int cb_offset = y_size + c_size;
-            int size = y_size + (c_size << 1);
-
-            how_recording_big = size;
-        }
-
+        how_recording_big = (video_width * video_height) * 12/8;
         if (how_recording_big != mRecordingFrameSize) {
             mRecordingFrameSize = how_recording_big;
-                
+
             if (mRecordingHeap) {
-                dmmu_info.vaddr = mRecordingHeap->data;
-                dmmu_info.size = mRecordingHeap->size;
-                dmmu_unmap_user_memory(&dmmu_info);
+                dmmu_unmap_memory((uint8_t*)mRecordingHeap->data,mRecordingHeap->size);
                 mRecordingHeap->release(mRecordingHeap);
                 mRecordingHeap = NULL;
             }
-			   
+
             mRecordingHeap = mget_memory(-1, mRecordingFrameSize,RECORDING_BUFFER_NUM, NULL);
-            dmmu_info.vaddr = mRecordingHeap->data;
-            dmmu_info.size = mRecordingHeap->size;
-
-            {
-                for (int i = 0; i < (int)(mRecordingHeap->size); i += 0x1000) {
-                    ((uint8_t*)(mRecordingHeap->data))[i] = 0;
-                }
-                ((uint8_t*)(mRecordingHeap->data))[mRecordingHeap->size - 1] = 0;
-            }
-
-            dmmu_map_user_memory(&dmmu_info);
-            ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
+            dmmu_map_memory((uint8_t*)mRecordingHeap->data,mRecordingHeap->size);
+            ALOGV("%s: line=%d",__FUNCTION__,__LINE__);
         }
     }
 
-    void CameraHal1::initPreviewHeap(int width, int height) {
+    void CameraHal1::initPreviewHeap(void) {
 
-        int preview_width = width, preview_height = height;
         int how_preview_big = 0;
         const char* format = NULL;
-        struct dmmu_mem_info dmmu_info;
 
         if (!mget_memory) {
             ALOGE("No memory allocator available");
             return;
         }
 
-        memset(&dmmu_info, 0, sizeof(struct dmmu_mem_info));
-        mJzParameters->getCameraParameters().getPreviewSize(&preview_width, &preview_height);
+        mJzParameters->getCameraParameters().getPreviewSize(&mPreviewWidth, &mPreviewHeight);
         format = mJzParameters->getCameraParameters().getPreviewFormat();
 
-        if (mRawPreviewWidth != preview_width || mRawPreviewHeight != preview_height) {
-            mRawPreviewWidth = preview_width;
-            mRawPreviewHeight = preview_height;
-        }
-
+        ALOGV("%s: init preview:%dx%d,format:%s",__FUNCTION__,mPreviewWidth,mPreviewHeight,format);
         if (strcmp(format, JZCameraParameters::PIXEL_FORMAT_JZ__YUV420T) == 0) {
             mPreviewFmt = HAL_PIXEL_FORMAT_JZ_YUV_420_B;
-            how_preview_big = (preview_width * preview_height * 12/8);
+            how_preview_big = (mPreviewWidth * mPreviewHeight * 12/8);
         } else if (strcmp(format, JZCameraParameters::PIXEL_FORMAT_JZ__YUV420P) == 0) {
             mPreviewFmt = HAL_PIXEL_FORMAT_JZ_YUV_420_P;
-            how_preview_big = (preview_width * preview_height * 12/8);
+            how_preview_big = (mPreviewWidth * mPreviewHeight * 12/8);
         }else if (strcmp(format ,CameraParameters::PIXEL_FORMAT_YUV422I) == 0) {
             mPreviewFmt = HAL_PIXEL_FORMAT_YCbCr_422_I;
-            how_preview_big = preview_width * preview_height << 1;
+            how_preview_big = mPreviewWidth * mPreviewHeight << 1;
         } else if(strcmp(format,CameraParameters::PIXEL_FORMAT_YUV420SP) == 0) {
             mPreviewFmt = HAL_PIXEL_FORMAT_YCrCb_420_SP;
-            how_preview_big = (preview_width * preview_height * 12/8);
+            how_preview_big = (mPreviewWidth * mPreviewHeight * 12/8);
         } else if (strcmp(format, CameraParameters::PIXEL_FORMAT_YUV422SP) == 0) {
             mPreviewFmt = HAL_PIXEL_FORMAT_YCbCr_422_SP;
-            how_preview_big = (preview_width * preview_height * 12/8);
+            how_preview_big = (mPreviewWidth * mPreviewHeight * 2);
         } else if (strcmp(format, CameraParameters::PIXEL_FORMAT_YUV420P) == 0) {
             mPreviewFmt = HAL_PIXEL_FORMAT_YV12;
-            int stride = (preview_width + 15) & (-16);
-            int y_size = stride * preview_height;
+            int stride = (mPreviewWidth + 15) & (-16);
+            int y_size = stride * mPreviewHeight;
             int c_stride = ((stride >> 1) + 15) & (-16);
-            int c_size = c_stride * preview_height >> 1;
+            int c_size = c_stride * mPreviewHeight >> 1;
             int cr_offset = y_size;
             int cb_offset = y_size + c_size;
             int size = y_size + (c_size << 1);
 
             how_preview_big = size;
-        } 
+        }
 
         if (how_preview_big != mPreviewFrameSize) {
             mPreviewFrameSize = how_preview_big;
 
             if (mPreviewHeap) {
                 mPreviewIndex = 0;
-                dmmu_info.vaddr = mPreviewHeap->data;
-                dmmu_info.size = mPreviewHeap->size;
-                dmmu_unmap_user_memory(&dmmu_info);
+                dmmu_unmap_memory((uint8_t*)mPreviewHeap->data, mPreviewHeap->size);
                 mPreviewHeap->release(mPreviewHeap);
                 mPreviewHeap = NULL;
             }
 
             mPreviewHeap = mget_memory(-1, mPreviewFrameSize,PREVIEW_BUFFER_CONUT,NULL);
-            dmmu_info.vaddr = mPreviewHeap->data;
-            dmmu_info.size = mPreviewHeap->size;
-
-            {
-                for (int i = 0; i < (int)(mPreviewHeap->size); i += 0x1000) {
-                    ((uint8_t*)(mPreviewHeap->data))[i] = 0;
-                }
-                ((uint8_t*)(mPreviewHeap->data))[mPreviewHeap->size - 1] = 0;
-            }
-			  
-            dmmu_map_user_memory(&dmmu_info);
-
-            ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
+            dmmu_map_memory((uint8_t*)mPreviewHeap->data, mPreviewHeap->size);
         }
-
     }
 
-	bool CameraHal1::thread_body_capture(void) {
+    bool CameraHal1::thread_body(void) {
 
-		ALOGE_IF(DEBUG_HAL1,"%s: line=%d",__FUNCTION__,__LINE__);
+        static int j = 0;
+        static int dropframe = 0;
+        static int64_t timeout = WAIT_TIME;
+        static int64_t startTime = 0;
+        static int64_t workTime = 0;
+        static int thread_state = WorkThread::THREAD_IDLE;
 
-		int64_t startTime = 0;
-		void *src = NULL;
-		int64_t workTime;
-		int64_t timeout;
-	
-		startTime = systemTime(SYSTEM_TIME_MONOTONIC);
-		
-		mDevice->flushCache(NULL);
-		
-		src = mDevice->getCurrentFrame(true); //40ms
-		
-		if (src == NULL) {
-			ALOGE("%s: current frame is null",__FUNCTION__);
-			return false;
-		}
+        WorkThread::ControlCmd res = getWorkThread()->receiveCmd(-1,timeout);
 
-		mCurrentFrame = (CameraYUVMeta*)src;
+        switch (res) {
 
-		if ((mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) && ccc) {
-			ccc->cimyuv420b_to_tile420(mCurrentFrame); //1- 4ms
-		}
+        case WorkThread::THREAD_ERROR:
+            {
+                if (j++ > 10) {
+                    ALOGE("%s: received cmd error, %s",__FUNCTION__, strerror(errno));
+                    goto exit_thread;
+                }
+                return true;
+            }
 
-		mCurFrameTimestamp = systemTime(SYSTEM_TIME_MONOTONIC);
+        case WorkThread::THREAD_STOP:
+            {
+                ALOGV("%s: thread stop",__FUNCTION__);
+                return false;
+            }
 
-		cameraCapture();
+        case WorkThread::THREAD_EXIT:
+            {
+            exit_thread:
+                j = 0;
+                close_x2d_dev();
+                close_ipu_dev();
+                thread_state = WorkThread::THREAD_EXIT;
+                timeout = WAIT_TIME;
+                startTime = 0;
+                dropframe = 0;
+                workTime = 0;
+                ALOGV("%s: Worker thread has been exit.",__FUNCTION__);
+                return false;
+            }
 
-		workTime = systemTime(SYSTEM_TIME_MONOTONIC) - startTime;
-		timeout = 80000000 - workTime;
-		if ( timeout > 1000000 )
-			usleep(timeout/1000);
+        case WorkThread::THREAD_TIMEOUT:
+            {
+                mreceived_cmd = false;
+                break;
+            }
 
-		ALOGE_IF(DEBUG_HAL1,"%s: fps = %d, workTime = %lld ", __FUNCTION__,
-		      mJzParameters->getCameraParameters().getPreviewFrameRate(),
-		      workTime);
+        case WorkThread::THREAD_IDLE:
+            {
+                thread_state = WorkThread::THREAD_IDLE;
+                dropframe = 0;
+                {
+                    AutoMutex lock(cmd_lock);
+                    mreceived_cmd = true;
+                    mCurrentFrame = NULL;
+                    mreceivedCmdCondition.signal();
+                }
+                ALOGV("%s: thread idle",__FUNCTION__);
+                break;
+            }
 
-		return true;
-	}
-
-	bool CameraHal1::thread_body_preview(void) {
-
-		void* src = NULL;
-		int64_t timeout = 0;
-		int64_t startTime = 0;
-		int64_t workTime = 0;
-
-		static int frame_count = 0;
-
-		startTime = systemTime(SYSTEM_TIME_MONOTONIC);
-
-		mDevice->flushCache(NULL);
-		
-		src = mDevice->getCurrentFrame(false); //40ms
-
-		if (src == NULL) {
-            ALOGE("%s: current frame is null",__FUNCTION__);
-            return false;
-		}
-
-		mCurrentFrame = (CameraYUVMeta*)src;
-
-		if ((mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) && ccc) {
-			ccc->cimyuv420b_to_tile420(mCurrentFrame); //1- 4ms
-			//ccc->cimyu420b_to_ipuyuv420b(mCurrentFrame);
-		}
-
-		mCurFrameTimestamp = systemTime(SYSTEM_TIME_MONOTONIC);
-		
-		postFrameForNotify(); // 5ms 
-
-        if (mdrop_frame == 3) {
-            postFrameForPreview(); // 5ms
-        } else {
-            mdrop_frame++;
+        case WorkThread::THREAD_READY:
+            {
+                thread_state = WorkThread::THREAD_READY;
+                {
+                    AutoMutex lock(cmd_lock);
+                    mreceived_cmd = true;
+                    mreceivedCmdCondition.signal();
+                }
+                ALOGV("%s: thread ready",__FUNCTION__);
+                break;
+            }
         }
 
-		workTime = systemTime(SYSTEM_TIME_MONOTONIC) - startTime;
-		
-		timeout = mPreviewAfter - workTime; // 50ms - 12ms - (45 + 2) = -9ms
+        if (thread_state == WorkThread::THREAD_READY) {
 
-		if ( timeout > 0 ) {
-			if ( timeout > 1000 )
-				usleep(timeout/1000);
-		}
+            startTime = systemTime(SYSTEM_TIME_MONOTONIC);
 
-		return true;
-	}
+            mDevice->flushCache(NULL,0);
+
+            if (mJzParameters->is_preview_size_change() ||
+                mJzParameters->is_picture_size_change() ||
+                mJzParameters->is_video_size_change()) {
+                ALOGD("%s:SetSignal reset preview",__FUNCTION__);
+                thread_state = WorkThread::THREAD_IDLE;
+                mDevice->sendCommand(STOP_PICTURE);
+                mHal1SignalThread->SetSignal(SIGNAL_RESET_PREVIEW);
+                return true;
+            }
+
+            mCurrentFrame = (CameraYUVMeta*)mDevice->getCurrentFrame(); //40ms
+
+            if (mCurrentFrame == NULL) {
+                timeout = WAIT_TIME;
+                thread_state = WorkThread::THREAD_IDLE;
+                //CHECK(!"current frame is null");
+                return true;
+            }
+
+            if ((mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) && ccc) {
+                ccc->cimyuv420b_to_tile420(mCurrentFrame); //1- 4ms
+            }
+
+            dump_data(false);
+
+            mCurFrameTimestamp = systemTime(SYSTEM_TIME_MONOTONIC);
+
+            postFrameForNotify(); // 5ms
+            if (dropframe == LOST_FRAME_NUM) {
+                postFrameForPreview(); // 5ms
+            } else {
+                dropframe++;
+            }
+
+            workTime = systemTime(SYSTEM_TIME_MONOTONIC) - mCurFrameTimestamp;
+
+            timeout = mPreviewAfter - workTime - (mCurFrameTimestamp - startTime); // 50ms - 12ms - (45 + 2) = -9ms
+        } else {
+            timeout = WAIT_TIME;
+        }
+
+        return true;
+    }
 
     void CameraHal1::postFrameForPreview() {
 
         int res = NO_ERROR;
-        if (mPreviewWindow == NULL)
-            return;
+        if ((mPreviewEnabled == false) || mPreviewWindow == NULL)
+            return ;
 
         buffer_handle_t* buffer = NULL;
         int stride = 0;
         res = mPreviewWindow->dequeue_buffer(mPreviewWindow, &buffer, &stride);
         if ((res != NO_ERROR) || (buffer == NULL)) {
-            ALOGE("%s: dequeue buffer error",__FUNCTION__);
+            CHECK(!"dequeue buffer error");
             return ;
         }
 
@@ -1077,7 +1249,7 @@ namespace android{
         }
 
         void *img = NULL;
-        const Rect rect(mCurrentFrame->width, mCurrentFrame->height);
+        const Rect rect(mPreviewWinWidth,mPreviewWinHeight);
         GraphicBufferMapper& mapper(GraphicBufferMapper::get());
         res = mapper.lock(*buffer, GRALLOC_USAGE_SW_WRITE_OFTEN, rect, &img);
         if (res != NO_ERROR) {
@@ -1101,76 +1273,57 @@ namespace android{
         uint8_t*src = (uint8_t*)(mCurrentFrame->yAddr);
         int srcWidth = mCurrentFrame->width;
         int srcHeight = mCurrentFrame->height;
+        camera_memory_t* tmp_mem = NULL;
+        int ret = NO_ERROR;
 
-        int xStart = (mPreviewWinWidth - srcWidth) >> 1;
-        int yStart = (mPreviewWinHeight - srcHeight) >> 1;
+        int xStart = 0;
+        int yStart = 0;
 
         IMG_native_handle_t* dst_handle = NULL;
         dst_handle = (IMG_native_handle_t*)(*buffer);
-        int dest_size = dst_handle->iHeight * dst_handle->iStride * (dst_handle->uiBpp >> 3);
-		  
-        if (xStart < 0 || yStart < 0) {
 
-            ALOGE_IF(DEBUG_HAL1,"Preview window is smaller than video preview size - Croppint image");
-
-            if (xStart < 0) {
-                srcWidth += (xStart<<1); //srcWidth += xStart;
-                src += ((-xStart) >> 1) << 1;
-                xStart = 0;
-            }
-
-            if (yStart < 0) {
-                srcHeight += (yStart<<1); //srcHeight += yStart;
-                src += ((-yStart)>>1) * srcStride;
-                yStart = 0;
-            }
-        }
-
-        int bytesPerPixel = 2;
+        ALOGV("src:%dx%d, preview: %dx%d, mPreWin:%dx%d",mCurrentFrame->width,
+               mCurrentFrame->height, mPreviewWidth, mPreviewHeight, mPreviewWinWidth, mPreviewWinHeight);
         if (mPreviewWinFmt == HAL_PIXEL_FORMAT_RGB_565) {
-            bytesPerPixel = 2;
+            mPrebytesPerPixel = 2;
         } else if (mPreviewWinFmt == HAL_PIXEL_FORMAT_JZ_YUV_420_P ||
                    mPreviewWinFmt == HAL_PIXEL_FORMAT_YCbCr_422_SP ||
                    mPreviewWinFmt == HAL_PIXEL_FORMAT_YCrCb_420_SP ||
                    mPreviewWinFmt == HAL_PIXEL_FORMAT_YV12 ) {
-            bytesPerPixel = 1;
+            mPrebytesPerPixel = 1;
         } else if (mPreviewWinFmt == HAL_PIXEL_FORMAT_RGB_888) {
-            bytesPerPixel = 3;
+            mPrebytesPerPixel = 3;
         } else if (mPreviewWinFmt == HAL_PIXEL_FORMAT_RGBA_8888 ||
                    mPreviewWinFmt == HAL_PIXEL_FORMAT_RGBX_8888 ||
                    mPreviewWinFmt == HAL_PIXEL_FORMAT_BGRA_8888) {
-            bytesPerPixel = 4;
+            mPrebytesPerPixel = 4;
         } else if (mPreviewWinFmt == HAL_PIXEL_FORMAT_YCbCr_422_I) {
-            bytesPerPixel = 2;
+            mPrebytesPerPixel = 2;
         }
-
-        int dstStride = bytesPerPixel * dst_handle->iStride;
-        uint8_t* dst = ((uint8_t*)img) + (xStart*bytesPerPixel) + (dstStride*yStart);
+        int dest_size = mPreviewWinWidth * mPreviewWinHeight * mPrebytesPerPixel;
+        int dstStride = mPrebytesPerPixel * mPreviewWinWidth;
+        uint8_t* dst = ((uint8_t*)img) + (xStart*mPrebytesPerPixel) + (dstStride*yStart);
 
         switch (mPreviewWinFmt) {
         case HAL_PIXEL_FORMAT_YCbCr_422_SP:
-            ALOGE_IF(DEBUG_PREVIEW_THREAD,"yuyv_to_yvu420sp (1)");
             if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I))
-                ccc->yuyv_to_yvu420sp(dst, dstStride, 
+                ccc->yuyv_to_yvu420sp(dst,mPreviewWinWidth,
                                       mPreviewWinHeight, src, srcStride, srcWidth, srcHeight);
             break;
 
         case HAL_PIXEL_FORMAT_YCrCb_420_SP:
-            ALOGE_IF(DEBUG_PREVIEW_THREAD,"yuyv_to_yvu420sp (2)");
             if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I))
-                ccc->yuyv_to_yvu420sp(dst, dstStride, mPreviewWinHeight, 
-                                      src, srcStride, srcWidth, srcHeight);
+                ccc->yuyv_to_yvu420sp(dst,mPreviewWinWidth,
+                                      mPreviewWinHeight,src, srcStride, srcWidth, srcHeight);
             break;
 
         case HAL_PIXEL_FORMAT_YV12:
-            ALOGE_IF(DEBUG_PREVIEW_THREAD,"yuyv_to_yvu420p (3)");
             if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I))
                 ccc->yuyv_to_yvu420p( dst, dstStride, mPreviewWinHeight, 
                                       src, srcStride, srcWidth, srcHeight);
             break;
 
         case PIXEL_FORMAT_YV16:
-            ALOGE_IF(DEBUG_PREVIEW_THREAD,"yuyv_to_yvu422p (4)");
             if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I))
                 ccc->yuyv_to_yvu422p(dst, dstStride, mPreviewWinHeight, 
                                      src, srcStride, srcWidth, srcHeight);
@@ -1178,7 +1331,6 @@ namespace android{
 
         case HAL_PIXEL_FORMAT_YCbCr_422_I:
             {
-                ALOGE_IF(DEBUG_PREVIEW_THREAD,"yuyv_to_yuyv (5)");
                 uint8_t* pdst = dst;
                 uint8_t* psrc = src;
                 int h;
@@ -1190,7 +1342,6 @@ namespace android{
             }
             break;
         case HAL_PIXEL_FORMAT_RGB_888:
-            ALOGE_IF(DEBUG_PREVIEW_THREAD,"yuyv_to_rgb24 (6)");
             if (ipu_open_status) {
                 ipu_convert_dataformat(mCurrentFrame,dst,buffer);
             } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) {
@@ -1199,13 +1350,11 @@ namespace android{
             break;
 
         case HAL_PIXEL_FORMAT_RGBA_8888:
-            ALOGE_IF(DEBUG_PREVIEW_THREAD,"yuyv_to_rgb32 (7)");
             if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I))
                 ccc->yuyv_to_rgb32(src, srcStride, dst, dstStride, srcWidth, srcHeight);
             break;
 
         case HAL_PIXEL_FORMAT_RGBX_8888:
-            ALOGE_IF(DEBUG_PREVIEW_THREAD,"yuyv_to_rgb32 (8)");
             if (ipu_open_status) {
                 ipu_convert_dataformat(mCurrentFrame,dst,buffer);
             } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) {
@@ -1215,36 +1364,21 @@ namespace android{
             break;
 
         case HAL_PIXEL_FORMAT_BGRA_8888:
-            ALOGE_IF(DEBUG_PREVIEW_THREAD,"yuyv_to_bgr32 (9)");
             if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) {
                 ccc->yuyv_to_bgr32(src, srcStride, dst, dstStride, srcWidth, srcHeight);
             }
             break;
 
         case HAL_PIXEL_FORMAT_RGB_565:
-            /**
-             * ipu and x2d  convert to rgb565
-             **/
-
-#ifdef CAMERA_USE_SOFT
-            if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_P)
-                        || (mCurrentFrame->format == HAL_PIXEL_FORMAT_YV12))) {
-                ccc->convert_yuv420p_to_rgb565(mCurrentFrame, dst);
-            } else if (ccc && mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) {
+#ifdef SOFT_CONVERT
+            if (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) {
                 ccc->tile420_to_rgb565(mCurrentFrame, dst);
-            } else if (ccc && mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I) {
-                ccc->yuyv_to_rgb565(src, srcStride, dst, dstStride, srcWidth, srcHeight);
+            } else if (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I){
+                ipu_convert_dataformat(mCurrentFrame,dst,buffer);
+                //ccc->yuyv_to_rgb565(src, srcStride, dst, dstStride, srcWidth, srcHeight);
             }
 #else
-            if (mDevice->usePmem()) {
-                ipu_convert_dataformat(mCurrentFrame,dst,buffer);
-            } else {
-                if (mCurrentFrame->format != HAL_PIXEL_FORMAT_YCbCr_422_I) {
-                    x2d_convert_dataformat(mCurrentFrame, dst,buffer);
-                } else {
-                    ipu_convert_dataformat(mCurrentFrame,dst,buffer);
-                }
-            }
+            ipu_convert_dataformat(mCurrentFrame,dst,buffer);
 #endif
             break;
 
@@ -1264,13 +1398,17 @@ namespace android{
                                             mPreviewWinWidth*2, srcWidth, srcHeight);
                         mFaceCount = CameraFaceDetect::getInstance()->detect((uint16_t*)rgb565->data);
                     } else if (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) {
-                        if (mDevice->usePmem()) {
+#ifdef SOFT_CONVERT
+                        ccc->tile420_to_rgb565(mCurrentFrame, (uint8_t*)(rgb565->data));
+#else
+#ifdef USE_X2D
+                        x2d_convert_dataformat(mCurrentFrame, 
+                                               (uint8_t*)(rgb565->data), buffer);
+#else
+                        if (ipu_open_status)
                             ipu_convert_dataformat(mCurrentFrame,(uint8_t*)(rgb565->data), buffer);
-                        } else {
-                            x2d_convert_dataformat(mCurrentFrame, 
-                                                   (uint8_t*)(rgb565->data), buffer);
-                        }
-                        //ccc->tile420_to_rgb565(mCurrentFrame, (uint8_t*)(rgb565->data));
+#endif
+#endif
                         mFaceCount = CameraFaceDetect::getInstance()->detect((uint16_t*)rgb565->data);
                     } else if (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_P) {
                         ccc->yuv420p_to_rgb565(src, (uint8_t*)(rgb565->data),srcWidth, srcHeight);
@@ -1282,315 +1420,216 @@ namespace android{
             }
         }
     preview_win_format_error:
+        if (tmp_mem != NULL) {
+            tmp_mem->release(tmp_mem);
+            tmp_mem = NULL;
+        }
         return NO_ERROR;
     }
 
     void CameraHal1::postFrameForNotify() {
 
         if ((mMesgEnabled & CAMERA_MSG_VIDEO_FRAME) && mVideoRecEnabled) {
-               
-            if ((NULL != mRecordingHeap) && (mRecordingHeap->data != NULL)) {
-                void* dest = NULL;
-                bool recFmtSupport = true;
-                camera_memory_t* tmpRecordingHeapBase = mDevice->getPreviewBufferHandle();
-                int index = mDevice->getPreviewFrameIndex();
-                switch(mRecFmt) {
-                case HAL_PIXEL_FORMAT_YCbCr_422_SP:
-                    ALOGE_IF(DEBUG_HAL1,"yuyv_to_yvu420sp, (1)");
-                    dest = (void*)((int)(mRecordingHeap->data)
-                                   + mRecordingFrameSize * mRecordingindex);
-                    if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) {
-                        ccc->yuyv_to_yvu420sp((uint8_t*)(dest),
-                                              mRawPreviewWidth, mRawPreviewHeight,
-                                              (uint8_t*)(mCurrentFrame->yAddr),
-                                              mCurrentFrame->yStride,
-                                              mCurrentFrame->width, mCurrentFrame->height);
-
-                    } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_P) ||
-                                       mCurrentFrame->format == HAL_PIXEL_FORMAT_YV12)) {
-                        ccc->yuv420p_to_yuv422sp((uint8_t*)(mCurrentFrame->yAddr),
-                                                 (uint8_t*)(dest),
-                                                 mCurrentFrame->width, mCurrentFrame->height);
-                    } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_SP) ||
-                                       (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCrCb_420_SP))) {
-                        memcpy((uint8_t*)dest, (uint8_t*)(mCurrentFrame->yAddr),
-                               mRecordingFrameSize);
-                    } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B)) {
-                        ccc->tile420_to_yuv420p(mCurrentFrame, (uint8_t*)(dest));
-                        ccc->yuv420p_to_yuv420sp((uint8_t*)(mCurrentFrame->yAddr),
-                                                 (uint8_t*)(dest), 
-                                                 mCurrentFrame->width, mCurrentFrame->height);
-                    } else {
-                        recFmtSupport = false;
-                    }
-                    break;
-
-                case HAL_PIXEL_FORMAT_YCrCb_420_SP:
-                    ALOGE_IF(DEBUG_HAL1,"yuyv_to_yvu420sp, (2)");
-                    dest = (void*)((int)(mRecordingHeap->data) 
-                                   + mRecordingFrameSize * mRecordingindex);
-                    if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) { 
-                        ccc->yuyv_to_yvu420sp((uint8_t*)(dest),
-                                              mCurrentFrame->width,mCurrentFrame->height,
-                                              (uint8_t*)(mCurrentFrame->yAddr), 
-                                              mCurrentFrame->yStride, mCurrentFrame->width,
-                                              mCurrentFrame->height);
-                    } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_SP)) {
-                        ccc->yuv422sp_to_yuv420sp((uint8_t*)(dest),(uint8_t*)(mCurrentFrame->yAddr),
-                                                  mCurrentFrame->width,mCurrentFrame->height);
-                    } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCrCb_420_SP)) {
-                        memcpy((uint8_t*)dest, (uint8_t*)(mCurrentFrame->yAddr),
-                               mRecordingFrameSize);
-                    } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_P) ||
-                                       mCurrentFrame->format == HAL_PIXEL_FORMAT_YV12)) {
-                        ccc->yuv420p_to_yuv420sp((uint8_t*)(mCurrentFrame->yAddr),
-                                                 (uint8_t*)(dest), 
-                                                 mCurrentFrame->width, mCurrentFrame->height);
-                    } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B)) {
-                        ccc->tile420_to_yuv420p(mCurrentFrame, (uint8_t*)(dest));
-                        ccc->yuv420p_to_yuv420sp((uint8_t*)(mCurrentFrame->yAddr),
-                                                 (uint8_t*)(dest), 
-                                                 mCurrentFrame->width, mCurrentFrame->height);
-                    } else {
-                        recFmtSupport = false;
-                    }
-                    break;
-
-                case HAL_PIXEL_FORMAT_YV12:
-                    ALOGE_IF(DEBUG_HAL1,"yuyv_to_yvu420p, (3)");
-                    dest = (void*)((int)(mRecordingHeap->data) 
-                                   + mRecordingFrameSize * mRecordingindex);
-                    if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) { 
-                        ccc->yuyv_to_yuv420p((uint8_t*)(dest),
-                                             mCurrentFrame->width,mCurrentFrame->height,
-                                             (uint8_t*)(mCurrentFrame->yAddr),
-                                             mCurrentFrame->yStride,
-                                             mCurrentFrame->width, mCurrentFrame->height);
-                    } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_YV12) ||
-                                       (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_P))) {
-                        memcpy(dest,(uint8_t*)(mCurrentFrame->yAddr),
-                               mRecordingFrameSize);
-                    } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_SP) ||
-                                       (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCrCb_420_SP))) {
-                        ccc->yuv420sp_to_yuv420p((uint8_t*)(mCurrentFrame->yAddr),
-                                                 (uint8_t*)(dest), 
-                                                 mCurrentFrame->width,mCurrentFrame->height);
-                    } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B)) {
-                        ccc->tile420_to_yuv420p(mCurrentFrame, (uint8_t*)(dest));
-                    } else {
-                        recFmtSupport = false;
-                    }
-                    break;
-                case HAL_PIXEL_FORMAT_YCbCr_422_I:
-                    ALOGE_IF(DEBUG_HAL1,"yuyv_to_yuyv, (4)");
-                    dest = (void*)((int)(mRecordingHeap->data) 
-                                   + mRecordingFrameSize * mRecordingindex);
-                    if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) {
-                        memcpy((uint8_t*)dest,(uint8_t*)(mCurrentFrame->yAddr),
-                               mRecordingFrameSize);
-                    } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B)){
-                        ccc->tile420_to_yuv420p(mCurrentFrame, (uint8_t*)(dest));
-                        //ccc->yuv420p_to_yuyv(mCurrentFrame, (uint8_t*)(mRecordingHeap->data));
-                    } else {
-                        recFmtSupport = false;
-                    }
-                    break;
-                case HAL_PIXEL_FORMAT_JZ_YUV_420_B:
-                    ALOGE_IF(DEBUG_HAL1,"jzyuv420tile video, (5)");
-                    dest = (void*)((int)(mRecordingHeap->data) 
-                                   + mRecordingFrameSize * mRecordingindex);
-                    if (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) {
-                        if (RECORDING_BUFFER_NUM == PREVIEW_BUFFER_CONUT)
-                            memcpy(dest, (uint8_t*)(mCurrentFrame->yAddr), mRecordingFrameSize);
-                    } else {
-                        recFmtSupport = false;
-                    }
-                    break;
-                case HAL_PIXEL_FORMAT_JZ_YUV_420_P:
-                    ALOGE_IF(DEBUG_HAL1,"jzyuv420p, (6)");
-                    dest = (void*)((int)(mRecordingHeap->data) 
-                                   + mRecordingFrameSize * mRecordingindex);
-                    if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B)) {
-                        ccc->tile420_to_yuv420p(mCurrentFrame, (uint8_t*)(dest));
-                    } if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) {
-                        ccc->yuyv_to_yuv420p((uint8_t*)(dest),
-                                             mCurrentFrame->width,mCurrentFrame->height,
-                                             (uint8_t*)(mCurrentFrame->yAddr), 
-                                             mCurrentFrame->yStride,
-                                             mCurrentFrame->width,mCurrentFrame->height);
-                    } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_P) || 
-                                       (mCurrentFrame->format == HAL_PIXEL_FORMAT_YV12))){
-                        memcpy((uint8_t*)dest, (uint8_t*)(mCurrentFrame->yAddr),
-                               mRecordingFrameSize);
-                    } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_SP) ||
-                                       (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCrCb_420_SP))) {
-                        ccc->yuv420sp_to_yuv420p((uint8_t*)(mCurrentFrame->yAddr),
-                                                 (uint8_t*)(dest), 
-                                                 mCurrentFrame->width,mCurrentFrame->height);
-                    } else {
-                        recFmtSupport = false;
-                    }
-                    break;
-                default:
-                    ALOGE("Recording format not support : error format = %d",mRecFmt);
-                    recFmtSupport = false;
-                    break;
-                }
-
-                if (recFmtSupport) {
-
-                    if (RECORDING_BUFFER_NUM == PREVIEW_BUFFER_CONUT) {
-                        mdata_cb_timestamp(mCurFrameTimestamp,CAMERA_MSG_VIDEO_FRAME,
-                                           mRecordingHeap, mRecordingindex, mcamera_interface);
-                        mRecordingindex = (mRecordingindex+1)%RECORDING_BUFFER_NUM; 
-                    } else {
-                        mdata_cb_timestamp(mCurFrameTimestamp,CAMERA_MSG_VIDEO_FRAME,
-                                           tmpRecordingHeapBase, mCurrentFrame->index, 
-                                           mcamera_interface);
-                    }
-
-                    //getWorkThread()->threadPause();
+#ifdef START_CAMERA_COLOR_CONVET_THREAD
+            if ((NULL != mRecordingHeap)
+                && (mRecordingHeap->data != NULL)
+                && ccc) {
+                uint8_t* dest = (uint8_t*)((int)(mRecordingHeap->data)
+                                           + mRecordingFrameSize * mRecordingindex);
+#ifdef CONVERTER_PMON
+                int time0 = GetTimer();
+#endif
+                ccc->mCC_SMPThread->SetConverterParameters(mCurrentFrame,dest,0,(mCurrentFrame->height/16)/2);
+                ccc->mCC_SMPThread->start_guest();
+                ccc->cimvyuy_to_tile420((uint8_t*)mCurrentFrame->yAddr,
+                                        mCurrentFrame->width,
+                                        mCurrentFrame->height,
+                                        dest,
+                                        (mCurrentFrame->height/16)/2,
+                                        (mCurrentFrame->height/16) - (mCurrentFrame->height/16)/2);//half of the frame
+                ccc->mCC_SMPThread->wait_guest();
+#ifdef CONVERTER_PMON
+                int time_use = GetTimer()-time0;
+                mtotaltime += time_use;
+                mtotalnum ++;
+                ALOGV("Dualll CONVERT TIME=%d,gettid=%d",time_use,gettid());
+#endif
+                mdata_cb_timestamp(mCurFrameTimestamp,CAMERA_MSG_VIDEO_FRAME,
+                                   mRecordingHeap, mRecordingindex, mcamera_interface);
+                mRecordingindex = (mRecordingindex+1)%RECORDING_BUFFER_NUM;
+                getWorkThread()->threadPause();
+            }
+#else
+            if (mget_memory) {
+                int size = getCurrentFrameSize();
+                camera_memory_t* recordingData = mget_memory(-1,size,1,NULL);
+                if ((recordingData != NULL) && (recordingData->data != NULL)) {
+                    memcpy(recordingData->data, (uint8_t*)mCurrentFrame->yAddr, size);
+                    AutoMutex lock(recordingDataQueueLock);
+                    mRecordingDataQueue.push_back(recordingData);
+                    mHal1SignalRecordingVideo.get()->SetSignal(SIGNAL_RECORDING_START);
                 }
             }
+#endif
         }
 
         if (mMesgEnabled & CAMERA_MSG_PREVIEW_FRAME) {
 
-            int width = 0, height = 0;
-
-            mJzParameters->getCameraParameters().getPreviewSize(&width, &height);
-
-            int cwidth = width;
-            int cheight = height;
+            int srcWidth = mCurrentFrame->width;
+            int srcHeight = mCurrentFrame->height;
+            uint8_t* src = (uint8_t*)mCurrentFrame->yAddr;
+            camera_memory_t* tmp_mem = NULL;
             bool convert_result = true;
+            int ret = NO_ERROR;
 
-            if (cwidth > mCurrentFrame->width)
-                cwidth = mCurrentFrame->width;
-            if (cheight > mCurrentFrame->height)
-                cheight = mCurrentFrame->height;
+            if (mJzParameters->is_preview_size_change()) {
+                ALOGV("%s:reset preview heap android format",__FUNCTION__);
+                initPreviewHeap();
+                NegotiatePreviewFormat(mPreviewWindow);
+            }
 
-            ALOGE_IF(DEBUG_HAL1,"post for preview frame, preview size =%dx%d, raw size = %dx%d", 
-                     width, height, mCurrentFrame->width, mCurrentFrame->height);
+            int cwidth = mPreviewWidth;
+            int cheight = mPreviewHeight;
+            int cFrameSize = mPreviewFrameSize;
+            int cFormat = mPreviewFmt;
+
+            if (cwidth < mCurrentFrame->width ||
+                cheight < mCurrentFrame->height) {
+                tmp_mem = mget_memory(-1, cwidth*cheight*2, 1, NULL);
+                ret = ipu_zoomIn_scale((uint8_t*)tmp_mem->data, cwidth, cheight, (uint8_t*)mCurrentFrame->yAddr,
+                                       mCurrentFrame->width, mCurrentFrame->height, mCurrentFrame->format, 0, mCurrentFrame->width);
+                if (ret != NO_ERROR) {
+                    ALOGE("%s: ipu up scale error",__FUNCTION__);
+                    cFormat = 0;
+                } else {
+                    src = (uint8_t*)tmp_mem->data;
+                    srcWidth = cwidth;
+                    srcHeight = cheight;
+                    ALOGV("%s: srcSize: %dx%d",__FUNCTION__, srcWidth, srcHeight);
+                }
+            }
+
+            //modify for weixin video chat mirror, rotation src data
+            int rot = 0;
+            if (mirror && ccc ) {
+                rot = mSensorListener->getOrientationCompensation();
+                if (rot == 90 || rot == 270) {
+                    ccc->yuyv_upturn(src,srcWidth, srcHeight);
+                } else if (rot == 0 || rot == 180) {
+                    ccc->yuyv_mirror(src, srcWidth, srcHeight);
+                }
+            }
+
+            ALOGV("preview size:%dx%d, raw size:%dx%d, dest format:0x%x, src fromat:0x%x, rot: %d",
+                  cwidth, cheight, mCurrentFrame->width, mCurrentFrame->height,cFormat, mCurrentFrame->format, rot);
             if ((mPreviewHeap != NULL) && (mPreviewHeap->data != NULL)) {
-                void* dest = NULL;
-                switch(mPreviewFmt) {
+                void* dest = (void*)((int)(mPreviewHeap->data) + mPreviewFrameSize*mPreviewIndex);
+                switch(cFormat) {
 
                 case HAL_PIXEL_FORMAT_YCbCr_422_SP:
-                    ALOGE_IF(DEBUG_HAL1,"yuyv_to_yvu420sp (1)");
-                    dest = (void*)((int)(mPreviewHeap->data) 
-                                   + mPreviewFrameSize*mPreviewIndex);
-                    if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) { 
-                        ccc->yuyv_to_yvu420sp((uint8_t*)(dest), 
-                                              width, height, (uint8_t*)(mCurrentFrame->yAddr), 
-                                              mCurrentFrame->yStride, cwidth, cheight);
+                    if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) {
+                        ccc->yuyv_to_yvu420sp((uint8_t*)(dest),
+                                              cwidth, cheight, src, 
+                                              srcWidth<<1, srcWidth, srcHeight);
                     } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B)) {
                         ccc->tile420_to_yuv420p(mCurrentFrame, (uint8_t*)(dest));
-                        ccc->yuv420p_to_yuv420sp((uint8_t*)(mCurrentFrame->yAddr),
-                                                 (uint8_t*)(dest), 
-                                                 mCurrentFrame->width, mCurrentFrame->height);
+                        ccc->yuv420p_to_yuv420sp(src,(uint8_t*)(dest),srcWidth, srcHeight);
                     } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_YCrCb_420_SP) ||
                                        (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_SP))) {
-                        memcpy((uint8_t*)(dest), (uint8_t*)(mCurrentFrame->yAddr), 
-                               mPreviewFrameSize);
+                        if (cwidth*cheight > mCurrentFrame->width * mCurrentFrame->height) {
+                            memcpy((uint8_t*)(dest), src, mCurrentFrame->width * mCurrentFrame->height*12/8);
+                        } else {
+                            memcpy((uint8_t*)(dest), src, mPreviewFrameSize);
+                        }
                     } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_YV12) || 
                                        (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_P))) {
-                        ccc->yuv420p_to_yuv420sp((uint8_t*)(mCurrentFrame->yAddr),
-                                                 (uint8_t*)(dest),
-                                                 mCurrentFrame->width, mCurrentFrame->height);
+                        ccc->yuv420p_to_yuv420sp(src, (uint8_t*)(dest),
+                                                 srcWidth, srcHeight);
                     } else {
                         convert_result = false;
                     }
                     break;
                 case HAL_PIXEL_FORMAT_YCrCb_420_SP:
-                    ALOGE_IF(DEBUG_HAL1,"yuyv_to_yvu420sp (2)");
-                    dest = (void*)((int)(mPreviewHeap->data) 
-                                   + mPreviewFrameSize*mPreviewIndex);
-                    if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) { 
-                        ccc->yuyv_to_yvu420sp((uint8_t*)(dest), 
-                                              width, height, (uint8_t*)(mCurrentFrame->yAddr), 
-                                              mCurrentFrame->yStride, cwidth, cheight);
+                    if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) {
+                        ccc->yuyv_to_yvu420sp((uint8_t*)(dest), cwidth, cheight, src, srcWidth<<1 ,srcWidth,srcHeight);
                     } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B)) {
                         ccc->tile420_to_yuv420p(mCurrentFrame, (uint8_t*)(dest));
-                        ccc->yuv420p_to_yuv420sp((uint8_t*)(mCurrentFrame->yAddr),
-                                                 (uint8_t*)(dest), 
-                                                 mCurrentFrame->width, mCurrentFrame->height);
+                        ccc->yuv420p_to_yuv420sp(src,(uint8_t*)(dest), srcWidth, srcHeight);
                     } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCrCb_420_SP)) {
-                        memcpy((uint8_t*)dest, (uint8_t*)(mCurrentFrame->yAddr), 
-                               mPreviewFrameSize);
+                        if (cwidth*cheight > mCurrentFrame->width * mCurrentFrame->height) {
+                            memcpy((uint8_t*)(dest), src, mCurrentFrame->width * mCurrentFrame->height*12/8);
+                        } else {
+                            memcpy((uint8_t*)(dest), src, mPreviewFrameSize);
+                        }
                     } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_SP)) {
-                        ccc->yuv422sp_to_yuv420sp((uint8_t*)(dest),(uint8_t*)(mCurrentFrame->yAddr),
-                                                  mCurrentFrame->width,mCurrentFrame->height);
-                    } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_YV12) || 
+                        ccc->yuv422sp_to_yuv420sp((uint8_t*)(dest),src,srcWidth, srcHeight);
+                    } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_YV12) ||
                                        (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_P))) {
-                        ccc->yuv420p_to_yuv420sp((uint8_t*)(mCurrentFrame->yAddr), 
-                                                 (uint8_t*)(dest),
-                                                 mCurrentFrame->width, mCurrentFrame->height);
+                        ccc->yuv420p_to_yuv420sp(src, (uint8_t*)(dest), srcWidth, srcHeight);
                     } else {
                         convert_result = false;
                     }
                     break;
                 case HAL_PIXEL_FORMAT_YV12:
-                    ALOGE_IF(DEBUG_HAL1,"yuyv_to_yvu420p (3)");
-                    dest = (void*)((int)(mPreviewHeap->data) 
-                                   + mPreviewFrameSize*mPreviewIndex);
                     if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) {
-                        ccc->yuyv_to_yvu420p((uint8_t*)(dest), 
-                                             width, height, (uint8_t*)(mCurrentFrame->yAddr), 
-                                             (mRawPreviewWidth<<1), cwidth, cheight); 
+                        ccc->yuyv_to_yvu420p((uint8_t*)(dest),cwidth, cheight, src,srcWidth<<1, srcWidth, srcHeight);
                     } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B)) {
                         ccc->tile420_to_yuv420p(mCurrentFrame, (uint8_t*)(dest));
                     } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_YV12) ||
                                        (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_P))) {
-                        memcpy((uint8_t*)dest,(uint8_t*)(mCurrentFrame->yAddr),
-                               mPreviewFrameSize);
+                        if (cwidth*cheight > mCurrentFrame->width * mCurrentFrame->height) {
+                            memcpy((uint8_t*)(dest), src, mCurrentFrame->width * mCurrentFrame->height*12/8);
+                        } else {
+                            memcpy((uint8_t*)(dest), src, mPreviewFrameSize);
+                        }
                     } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCrCb_420_SP)) {
-                        ccc->yuv420sp_to_yuv420p((uint8_t*)(mCurrentFrame->yAddr), 
-                                                 (uint8_t*)(dest),
-                                                 mCurrentFrame->width,
-                                                 mCurrentFrame->height);
+                        ccc->yuv420sp_to_yuv420p(src, (uint8_t*)(dest),srcWidth, srcHeight);
                     } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_SP)) {
-                        ccc->yuv422sp_to_yuv420p((uint8_t*)dest, (uint8_t*)(mCurrentFrame->yAddr),
-                                                 mCurrentFrame->width, mCurrentFrame->height);
+                        ccc->yuv422sp_to_yuv420p((uint8_t*)dest, src,srcWidth, srcHeight);
                     } else {
                         convert_result = false;
                     }
                     break;
                 case HAL_PIXEL_FORMAT_YCbCr_422_I:
-                    ALOGE_IF(DEBUG_HAL1,"yuyv_to_yuyv (4)");
-                    dest = (void*)((int)(mPreviewHeap->data) 
-                                   + mPreviewFrameSize*mPreviewIndex);
                     if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B)) {
                         ccc->tile420_to_yuv420p(mCurrentFrame, (uint8_t*)(dest));
                         //ccc->yuv420p_to_yuyv(mCurrentFrame, (uint8_t*)(dest));
                     } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) {
-                        memcpy((uint8_t*)dest, (uint8_t*)(mCurrentFrame->yAddr),
-                               mPreviewFrameSize);
+                        if (cwidth*cheight > mCurrentFrame->width * mCurrentFrame->height) {
+                            memcpy((uint8_t*)(dest), src, mCurrentFrame->width * mCurrentFrame->height*2);
+                        } else {
+                            memcpy((uint8_t*)(dest), src, mPreviewFrameSize);
+                        }
                     } else {
                         convert_result = false;
                     }
                     break;
                 case HAL_PIXEL_FORMAT_JZ_YUV_420_B:
-                    ALOGE_IF(DEBUG_HAL1,"jzyuv420tile_to_yuv420p (5)");
-                    dest = (void*)((int)(mPreviewHeap->data) 
-                                   + mPreviewFrameSize * mPreviewIndex);
                     if (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) {
-                        memcpy((uint8_t*)dest, (uint8_t*)(mCurrentFrame->yAddr),mPreviewFrameSize);
+                        if (cwidth*cheight > mCurrentFrame->width * mCurrentFrame->height) {
+                            memcpy((uint8_t*)(dest), src, mCurrentFrame->width * mCurrentFrame->height*12/8);
+                        } else {
+                            memcpy((uint8_t*)(dest), src, mPreviewFrameSize);
+                        }
+                    } else {
+                        memset((uint8_t*)(dest), 0xff, mPreviewFrameSize);
                     }
                     break;
                 case HAL_PIXEL_FORMAT_JZ_YUV_420_P:
-                    ALOGE_IF(DEBUG_HAL1,"jzyuv420p_to_yuv420p (6)");
-                    dest = (void*)((int)(mPreviewHeap->data) 
-                                   + mPreviewFrameSize*mPreviewIndex);
-                    if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B)) {
+                    if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I)) {
+                        ccc->yuyv_to_yvu420p((uint8_t*)(dest),cwidth, cheight, src,srcWidth<<1,srcWidth, srcHeight);
+                    } else if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B)) {
                         ccc->tile420_to_yuv420p(mCurrentFrame, (uint8_t*)(dest));
                     } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_P) ||
                                        (mCurrentFrame->format == HAL_PIXEL_FORMAT_YV12))) {
-                        memcpy((uint8_t*)dest, (uint8_t*)(mCurrentFrame->yAddr),mPreviewFrameSize);
+                        if (cwidth*cheight > mCurrentFrame->width * mCurrentFrame->height) {
+                            memcpy((uint8_t*)(dest), src, mCurrentFrame->width * mCurrentFrame->height*12/8);
+                        } else {
+                            memcpy((uint8_t*)(dest), src, mPreviewFrameSize);
+                        }
                     } else if (ccc && ((mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_SP) ||
                                        (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCrCb_420_SP))) {
-                        ccc->yuv420sp_to_yuv420p((uint8_t*)(mCurrentFrame->yAddr),
-                                                 (uint8_t*)(dest),
-                                                 mCurrentFrame->width, mCurrentFrame->height);
+                        ccc->yuv420sp_to_yuv420p(src, (uint8_t*)(dest),srcWidth, srcHeight);
                     } else {
                         convert_result = false;
                     }
@@ -1603,6 +1642,12 @@ namespace android{
                     mdata_cb(CAMERA_MSG_PREVIEW_FRAME, mPreviewHeap, mPreviewIndex, 
                              NULL,mcamera_interface);
                     mPreviewIndex = (mPreviewIndex+1)%PREVIEW_BUFFER_CONUT;
+                } else {
+                    ALOGE("%s: format 0x%x is not support",__FUNCTION__,cFormat);
+                }
+                if (tmp_mem != NULL) {
+                    tmp_mem->release(tmp_mem);
+                    tmp_mem = NULL;
                 }
             }
         }
@@ -1685,57 +1730,77 @@ namespace android{
                     frame_metadata.faces = NULL;
                 }
             }
-            ALOGE_IF(DEBUG_HAL1,"%s: ret = %d", __FUNCTION__, ret);
         }
+
+        if (mTakingPicture) {
+
+            if (mJzParameters->is_picture_size_change()
+                || mJzParameters->is_video_size_change()) {
+                mDevice->sendCommand(STOP_PICTURE);
+                return;
+            }
+
+            mTakingPicture = false;
+            int size = getCurrentFrameSize();
+
+            camera_memory_t* takingPictureHeap = mget_memory(-1, size,1, NULL);
+            memset(takingPictureHeap->data, 0, size);
+            dmmu_map_memory((uint8_t*)takingPictureHeap->data,takingPictureHeap->size);
+
+            if(mzoomVal != 0){
+                do_zoom((uint8_t*)takingPictureHeap->data,(uint8_t*)mCurrentFrame->yAddr);
+            } else {
+                memcpy(takingPictureHeap->data, (uint8_t*)mCurrentFrame->yAddr,size);
+            }
+
+            {
+                AutoMutex lock(mcapture_lock);
+                mListCaptureHeap.push_back(takingPictureHeap);
+            }
+
+            if (mMesgEnabled & CAMERA_MSG_SHUTTER)
+                mnotify_cb(CAMERA_MSG_SHUTTER, 0, 0, mcamera_interface);
+
+            if (mMesgEnabled & CAMERA_MSG_RAW_IMAGE_NOTIFY)
+                mnotify_cb(CAMERA_MSG_RAW_IMAGE_NOTIFY, 0, 0, mcamera_interface);
+
+            if (mMesgEnabled & CAMERA_MSG_RAW_IMAGE) {
+                mdata_cb(CAMERA_MSG_RAW_IMAGE,takingPictureHeap, 0, NULL, mcamera_interface);
+            }
+
+            if (mMesgEnabled & CAMERA_MSG_POSTVIEW_FRAME) {
+                mdata_cb(CAMERA_MSG_RAW_IMAGE,takingPictureHeap, 0, NULL, mcamera_interface);
+            }
+
+            if (mMesgEnabled & CAMERA_MSG_COMPRESSED_IMAGE)
+                mWorkerQueue->schedule(new PostJpegUnit(this));
+        }
+
         return;
     }
-
-	void CameraHal1::cameraCapture() {
-
-        bool is_video = strcmp(mJzParameters->getCameraParameters().get(CameraParameters::KEY_RECORDING_HINT),"true") == 0;
-
-		if (!is_video && (mMesgEnabled & CAMERA_MSG_SHUTTER)) {
-			mnotify_cb(CAMERA_MSG_SHUTTER, 0, 0, mcamera_interface);
-		}
-
-        if (mMesgEnabled & CAMERA_MSG_RAW_IMAGE_NOTIFY)
-            mnotify_cb(CAMERA_MSG_RAW_IMAGE_NOTIFY, 0, 0, mcamera_interface);
-
-        if (!is_video && (mMesgEnabled & CAMERA_MSG_RAW_IMAGE) && (mCurrentFrame->yAddr>0))
-            mdata_cb(CAMERA_MSG_RAW_IMAGE, mDevice->getCaptureBufferHandle(),
-                     mCurrentFrame->index, NULL, mcamera_interface);
-
-        if (!is_video && (mMesgEnabled & CAMERA_MSG_POSTVIEW_FRAME) && (mCurrentFrame->yAddr>0))
-            mdata_cb(CAMERA_MSG_RAW_IMAGE,mDevice->getCaptureBufferHandle(), 
-                     mCurrentFrame->index, NULL, mcamera_interface);
-
-		if (mMesgEnabled & CAMERA_MSG_COMPRESSED_IMAGE) {
-			int64_t jpeg_s = systemTime(SYSTEM_TIME_MONOTONIC);
-			int64_t jpeg_e = 0;
-			postJpegDataToApp();
-			//mWorkerQueue->schedule(new PostJpegUnit(this));
-			jpeg_e = systemTime(SYSTEM_TIME_MONOTONIC) - jpeg_s;
-			ALOGE("postJpegDataToApp() use time: %lld us", jpeg_e/1000);
-		}
-	}
 
     void CameraHal1::postJpegDataToApp(void) {
 
         if ((mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) && ccc) {
             hardCompressJpeg();
-        } else if (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I) {
+        } else if (mCurrentFrame->format == HAL_PIXEL_FORMAT_YCbCr_422_I
+                   || mCurrentFrame->format == HAL_PIXEL_FORMAT_YV12
+                   || mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_P) {
             softCompressJpeg();
         } else {
-            ALOGE("%s: don't support other format(%d) for compress jpeg, ccc=%p",
-                  __FUNCTION__,mCurrentFrame->format, ccc?ccc:0);
+            ALOGE("%s: don't support other format: 0x%x for compress jpeg",
+                  __FUNCTION__,mCurrentFrame->format);
         }
-
+        mDevice->deInitTakePicture();
+        if (mVideoRecEnabled) {
+            mDevice->sendCommand(STOP_PICTURE);
+        }
         return;
     }
 
     void CameraHal1::softCompressJpeg(void) {
 
-        ALOGE_IF(DEBUG_HAL1,"%s: Enter", __FUNCTION__);
+        ALOGV("%s: Enter", __FUNCTION__);
 
         camera_memory_t* jpeg_buff = NULL;
         int ret = convertCurrentFrameToJpeg(&jpeg_buff);
@@ -1746,66 +1811,58 @@ namespace android{
         } else if (jpeg_buff != NULL && jpeg_buff->data != NULL) {
             jpeg_buff->release(jpeg_buff);
         }
-
-        mDevice->freeStream(CAPTURE_BUFFER);
-
     }
 
     void CameraHal1::hardCompressJpeg(void) {
 
-        ALOGE_IF(DEBUG_HAL1,"%s: Enter",__FUNCTION__);
+        ALOGV("%s: Enter",__FUNCTION__);
 
         status_t ret = UNKNOWN_ERROR;
-        int width = 0, height = 0;
-        const char* is_video = NULL;
 
-        is_video = mJzParameters->getCameraParameters().get(CameraParameters::KEY_RECORDING_HINT);
-        if (is_video == NULL)
-            is_video = "false";
+        if (mListCaptureHeap.empty()) {
+            ALOGE("%s: don't have capture heap",__FUNCTION__);
+            return;
+        }
 
-        if (mJzParameters->getPropertyPictureSize(&width, &height) !=  NO_ERROR)
-            mJzParameters->getCameraParameters().getPictureSize(&width, &height);
         int picQuality = mJzParameters->getCameraParameters().getInt(CameraParameters::KEY_JPEG_QUALITY);
         int thumQuality = mJzParameters->getCameraParameters()
             .getInt(CameraParameters::KEY_JPEG_THUMBNAIL_QUALITY);
         if (picQuality <= 0 || picQuality == 100) picQuality = 90;
         if (thumQuality <= 0 || thumQuality == 100) thumQuality = 90;
 
-        if (strcmp(is_video,"true") == 0) {
-            //mJzParameters->getCameraParameters().getVideoSize(&width, &height);
-            mJzParameters->getCameraParameters().getPreviewSize(&width, &height);
-            ALOGE("start recording you want take picture %d x  %d", width, height);
-        }
-
-        int csize = mDevice->getCaptureFrameSize();
+        int csize = getCurrentFrameSize();
         int th_width = mJzParameters->getCameraParameters().
             getInt(CameraParameters::KEY_JPEG_THUMBNAIL_WIDTH);
         int th_height =  mJzParameters->getCameraParameters().
             getInt(CameraParameters::KEY_JPEG_THUMBNAIL_HEIGHT);
-        int ctnsize =  th_width * th_height;
+        int ctnsize = th_width * th_height;
 
         int jpeg_size = csize;
         int thumb_size = ctnsize;
         camera_memory_t* jpeg_buff = mget_memory(-1,csize+1000 ,1,NULL);
-        camera_memory_t* jpeg_tn_buff = (ctnsize == 0) ? NULL : (mget_memory(-1, ctnsize+1000, 1, NULL));
+        camera_memory_t* jpeg_tn_buff = (ctnsize == 0) ? NULL : (mget_memory(-1, ctnsize, 1, NULL));
         camera_memory_t* jpegMem = NULL;
+        camera_memory_t* captureHeap = NULL;
+        {
+            AutoMutex lock(mcapture_lock);
+            captureHeap = *(mListCaptureHeap.begin());
+            mListCaptureHeap.erase(mListCaptureHeap.begin());
+        }
 
-#ifdef COMPRESS_JPEG_USE_HW
+#ifdef CAMERA_SUPPORT_VIDEOSNAPSHORT
         CameraCompressorHW ccHW;
         compress_params_hw_t hw_cinfo;
-
         memset(&hw_cinfo, 0, sizeof(compress_params_hw_t));
-
-        hw_cinfo.pictureYUV420_y = (uint8_t*)(mCurrentFrame->yAddr);
-        hw_cinfo.pictureYUV420_c = (uint8_t*)(mCurrentFrame->yAddr 
-                                              + mCurrentFrame->width*mCurrentFrame->height);
-        hw_cinfo.pictureWidth = width;
-        hw_cinfo.pictureHeight = height;
+        hw_cinfo.pictureYUV420_y = (uint8_t*)(captureHeap->data);
+        hw_cinfo.pictureYUV420_c = (uint8_t*)((uint8_t*)captureHeap->data
+                                              + (mCurrentFrame->width*mCurrentFrame->height));
+        hw_cinfo.pictureWidth = mCurrentFrame->width;
+        hw_cinfo.pictureHeight = mCurrentFrame->height;
         hw_cinfo.pictureQuality = picQuality;
         hw_cinfo.thumbnailWidth = th_width;
         hw_cinfo.thumbnailHeight = th_height;
         hw_cinfo.thumbnailQuality = thumQuality;
-        hw_cinfo.format = mCurrentFrame->format;
+        hw_cinfo.format = HAL_PIXEL_FORMAT_JZ_YUV_420_B;
         hw_cinfo.jpeg_out = (unsigned char*)(jpeg_buff->data);
         hw_cinfo.jpeg_size = &jpeg_size;
         hw_cinfo.th_jpeg_out = (jpeg_tn_buff==NULL) ? NULL : ((unsigned char*)(jpeg_tn_buff->data));
@@ -1815,15 +1872,21 @@ namespace android{
 
         ccHW.setPrameters(&hw_cinfo);
         ccHW.hw_compress_to_jpeg();
-#endif
+
         ExifElementsTable* exif = new ExifElementsTable();
         if (NULL != exif) {
             mJzParameters->setUpEXIF(exif);
             exif->insertExifToJpeg((unsigned char*)(jpeg_buff->data),jpeg_size);
             if (NULL != jpeg_tn_buff
-                && jpeg_tn_buff->data != NULL 
-                && thumb_size > 0) {
-                exif->insertExifThumbnailImage((const char*)(jpeg_tn_buff->data), (int)thumb_size);
+                && jpeg_tn_buff->data != NULL) {
+                if (th_width*th_height >= mCurrentFrame->width*mCurrentFrame->height) {
+                    exif->insertExifThumbnailImage((const char*)(jpeg_buff->data), (int)jpeg_size);
+                } else {
+                    ccHW.rgb565_to_jpeg((uint8_t*)jpeg_tn_buff->data,
+                                        &thumb_size,(uint8_t*)(captureHeap->data),
+                                        th_width, th_height,thumQuality);
+                    exif->insertExifThumbnailImage((const char*)(jpeg_tn_buff->data), (int)thumb_size);
+                }
             }
             Section_t* exif_section = NULL;
             exif_section = FindSection(M_EXIF);
@@ -1837,6 +1900,9 @@ namespace android{
                 }
             }
         }
+#else
+        mdata_cb(CAMERA_MSG_COMPRESSED_IMAGE, captureHeap, 0, NULL, mcamera_interface);
+#endif
 
         if (jpeg_buff != NULL) {
             jpeg_buff->release(jpeg_buff);
@@ -1853,69 +1919,87 @@ namespace android{
             jpegMem = NULL;
         }
 
-        mDevice->freeStream(CAPTURE_BUFFER);
+        if (captureHeap != NULL) {
+            dmmu_unmap_memory((uint8_t*)captureHeap->data,captureHeap->size);
+            captureHeap->release(captureHeap);
+            captureHeap = NULL;
+        }
     }
 
     status_t CameraHal1::convertCurrentFrameToJpeg(camera_memory_t** jpeg_buff) {
 
         status_t ret = UNKNOWN_ERROR;
-        int width = 0, height = 0;
-        const char* is_video = NULL;
+        camera_memory_t* tmp_buf = NULL;
 
-        is_video = mJzParameters->getCameraParameters().get(CameraParameters::KEY_RECORDING_HINT);
-        if (is_video == NULL)
-            is_video = "false";
+        if (mListCaptureHeap.empty()) {
+            ALOGE("%s: don't have capture heap",__FUNCTION__);
+            return ret;
+        }
 
-        if (mJzParameters->getPropertyPictureSize(&width, &height) !=  NO_ERROR)
-            mJzParameters->getCameraParameters().getPictureSize(&width, &height);
         int picQuality = mJzParameters->getCameraParameters().getInt(CameraParameters::KEY_JPEG_QUALITY);
         int thumQuality = mJzParameters->getCameraParameters()
             .getInt(CameraParameters::KEY_JPEG_THUMBNAIL_QUALITY);
         if (picQuality <= 0 || picQuality == 100) picQuality = 75;
         if (thumQuality <= 0 || thumQuality == 100) thumQuality = 75;
 
-        if (strcmp(is_video,"true") == 0) {
-            //mJzParameters->getCameraParameters().getVideoSize(&width, &height);
-            mJzParameters->getCameraParameters().getPreviewSize(&width, &height);
-            ALOGE("%s: start recording you want take picture %dx%d",__FUNCTION__,
-                  width, height);
-        }
-
         compress_params_t params;
         memset(&params, 0, sizeof(compress_params_t));
-        params.src = (uint8_t*)(mCurrentFrame->yAddr);
-        params.pictureWidth = width;
-        params.pictureHeight = height;
+        camera_memory_t* captureHeap = NULL;
+        {
+            AutoMutex lock(mcapture_lock);
+            captureHeap = *(mListCaptureHeap.begin());
+            mListCaptureHeap.erase(mListCaptureHeap.begin());
+        }
+        if (ccc && (mCurrentFrame->format == HAL_PIXEL_FORMAT_YV12
+                    || mCurrentFrame->format == HAL_PIXEL_FORMAT_JZ_YUV_420_P)) {
+            tmp_buf = mget_memory(-1,captureHeap->size,1,NULL);
+            ccc->yuv420p_to_yuv420sp((uint8_t*)(captureHeap->data),
+                                     (uint8_t*)tmp_buf->data,mCurrentFrame->width,mCurrentFrame->height);
+            params.src = (uint8_t*)(tmp_buf->data);
+            params.format = HAL_PIXEL_FORMAT_YCrCb_420_SP;
+        } else {
+            params.src = (uint8_t*)(captureHeap->data);
+            params.format = mCurrentFrame->format;
+        }
+        params.pictureWidth = mCurrentFrame->width;
+        params.pictureHeight = mCurrentFrame->height;
         params.pictureQuality = picQuality;
-        params.thumbnailWidth = 
+        params.thumbnailWidth =
             mJzParameters->getCameraParameters()
             .getInt(CameraParameters::KEY_JPEG_THUMBNAIL_WIDTH);
-        params.thumbnailHeight = 
+        params.thumbnailHeight =
             mJzParameters->getCameraParameters()
             .getInt(CameraParameters::KEY_JPEG_THUMBNAIL_HEIGHT);
         params.thumbnailQuality = thumQuality;
-        params.format = mCurrentFrame->format;
         params.jpegSize = 0;
         params.requiredMem = mget_memory;
 
         int rot = mJzParameters->getCameraParameters()
             .getInt(CameraParameters::KEY_ROTATION);
         CameraCompressor compressor(&params,mirror,rot);
-
         ExifElementsTable* exif = new ExifElementsTable();
         if (NULL != exif) {
             mJzParameters->setUpEXIF(exif);
             ret = compressor.compress_to_jpeg(exif, jpeg_buff);
         }
 
+        if (captureHeap != NULL) {
+            dmmu_unmap_memory((uint8_t*)captureHeap->data,captureHeap->size);
+            captureHeap->release(captureHeap);
+            captureHeap = NULL;
+        }
+        if (tmp_buf != NULL) {
+            tmp_buf->release(tmp_buf);
+            tmp_buf = NULL;
+        }
         return ret;
     }
 
 
     status_t CameraHal1::softFaceDetectStart(int32_t detect_type) {
 
-        int w = mCurrentFrame->width;
-        int h = mCurrentFrame->height;
+        int w = mRawPreviewWidth;
+        int h = mRawPreviewHeight;
         int maxFaces = 0;
         status_t res = NO_ERROR;
 
@@ -1924,13 +2008,13 @@ namespace android{
             case CAMERA_FACE_DETECTION_HW:
                 ALOGE("start hardware face detect");
                 maxFaces = mJzParameters->getCameraParameters()
-					.getInt(CameraParameters::KEY_MAX_NUM_DETECTED_FACES_HW);
+                    .getInt(CameraParameters::KEY_MAX_NUM_DETECTED_FACES_HW);
                 goto hard_detect_method;
                 break;
             case CAMERA_FACE_DETECTION_SW:
                 ALOGE("start Software face detection");
                 maxFaces = mJzParameters->getCameraParameters()
-					.getInt(CameraParameters::KEY_MAX_NUM_DETECTED_FACES_SW);
+                    .getInt(CameraParameters::KEY_MAX_NUM_DETECTED_FACES_SW);
                 goto soft_detect_method;
                 break;
             }
@@ -1940,10 +2024,10 @@ namespace android{
 
         if (maxFaces == 0) {
             isSoftFaceDetectStart = false;
-            return -1;
+            return BAD_VALUE;
         }
 
-        ALOGE_IF(DEBUG_HAL1,"%s: max Face = %d", __FUNCTION__,maxFaces);
+        ALOGV("%s: max Face = %d", __FUNCTION__,maxFaces);
 
         res = CameraFaceDetect::getInstance()->initialize(w, h, maxFaces);
         if (res == NO_ERROR) {
@@ -1968,6 +2052,8 @@ namespace android{
 
         struct jz_x2d_config x2d_cfg;
         IMG_native_handle_t* dst_handle = NULL;
+        int map_size = 0;
+        int ret = NO_ERROR;
 
         if (x2d_fd < 0) {
             ALOGE("%s: open %s error or not open it", __FUNCTION__, X2D_NAME);
@@ -1975,29 +2061,29 @@ namespace android{
         }
 
         dst_handle = (IMG_native_handle_t*)(*buffer);
-        struct dmmu_mem_info dst_dmmu;
+        map_size = mPreviewWinWidth * mPreviewWinHeight * mPrebytesPerPixel;
+        dmmu_map_memory((uint8_t*)dst_buf,map_size);
 
-        dst_dmmu.vaddr = (void*)(dst_buf);
-        dst_dmmu.size = dst_handle->iHeight * dst_handle->iStride * (dst_handle->uiBpp >> 3);
-        int ret = 0;
-        ret = dmmu_map_user_memory(&dst_dmmu);
-        if (ret != 0) {
-            ALOGE("%s: dmmu map user memory ret = %d",__FUNCTION__, ret);
-            return ;
-        }
-
+        mDevice->flushCache((void*)yuvMeta->yAddr, map_size);
         /* set dst configs */
         x2d_cfg.dst_address = (int)dst_buf;
-        x2d_cfg.dst_width = dst_handle->iWidth;
-        x2d_cfg.dst_height = dst_handle->iHeight;
-        x2d_cfg.dst_format = X2D_OUTFORMAT_RGB565;
-        x2d_cfg.dst_stride = dst_handle->iStride * (dst_handle->uiBpp >> 3);
-
+        x2d_cfg.dst_width = mPreviewWinWidth;//dst_handle->iWidth;
+        x2d_cfg.dst_height = mPreviewWinHeight;//dst_handle->iHeight;
+        if (mPreviewWinFmt == HAL_PIXEL_FORMAT_RGB_565)
+            x2d_cfg.dst_format = X2D_OUTFORMAT_RGB565;
+        else if (mPreviewWinFmt == HAL_PIXEL_FORMAT_RGBA_8888
+                 || mPreviewWinFmt == HAL_PIXEL_FORMAT_RGBX_8888
+                 || mPreviewWinFmt == HAL_PIXEL_FORMAT_BGRA_8888)
+            x2d_cfg.dst_format = X2D_OUTFORMAT_XRGB888;
+        else if (mPreviewWinFmt == HAL_PIXEL_FORMAT_RGB_888)
+            x2d_cfg.dst_format = X2D_OUTFORMAT_ARGB888;
+        x2d_cfg.dst_stride = mPreviewWinWidth * mPrebytesPerPixel;
+        //dst_handle->iStride * (dst_handle->uiBpp >> 3);
         x2d_cfg.dst_back_en = 0;
         x2d_cfg.dst_glb_alpha_en = 1;
         x2d_cfg.dst_preRGB_en = 0;
         x2d_cfg.dst_mask_en = 1;
-        x2d_cfg.dst_alpha_val = 0x80;	
+        x2d_cfg.dst_alpha_val = 0x80;
         x2d_cfg.dst_bcground = 0xff0ff0ff;
 
         x2d_cfg.tlb_base = mDevice->getTlbBase();
@@ -2030,14 +2116,14 @@ namespace android{
             return;
         }
 
-        /* src rotation degree */	
+        /* src rotation degree */
         x2d_cfg.lay[0].transform = X2D_ROTATE_0;
 
-        /* src input geometry && output geometry */		
+        /* src input geometry && output geometry */
         x2d_cfg.lay[0].in_width =  yuvMeta->width;
         x2d_cfg.lay[0].in_height = yuvMeta->height;
-        x2d_cfg.lay[0].out_width = dst_handle->iWidth;
-        x2d_cfg.lay[0].out_height = dst_handle->iHeight;
+        x2d_cfg.lay[0].out_width = mPreviewWinWidth;//dst_handle->iWidth;
+        x2d_cfg.lay[0].out_height = mPreviewWinHeight;//dst_handle->iHeight;
         x2d_cfg.lay[0].out_w_offset = 0;
         x2d_cfg.lay[0].out_h_offset = 0;
         x2d_cfg.lay[0].mask_en = 0;
@@ -2066,13 +2152,15 @@ namespace android{
             x2d_cfg.lay[0].v_scale_ratio = (int)(v_scale * X2D_SCALE_FACTOR);
             break;
         default:
+            dmmu_unmap_memory((uint8_t*)dst_buf,map_size);
             ALOGE("%s %s %d:undefined rotation degree!!!!", __FILE__, __FUNCTION__, __LINE__);
             return;
         }
-		 
+
         /* ioctl set configs */
         ret = ioctl(x2d_fd, IOCTL_X2D_SET_CONFIG, &x2d_cfg);
         if (ret < 0) {
+            dmmu_unmap_memory((uint8_t*)dst_buf,map_size);
             ALOGE("%s %s %d: IOCTL_X2D_SET_CONFIG failed", __FILE__, __FUNCTION__, __LINE__);
             return ;
         }
@@ -2080,16 +2168,11 @@ namespace android{
         /* ioctl start compose */
         ret = ioctl(x2d_fd, IOCTL_X2D_START_COMPOSE);
         if (ret < 0) {
+            dmmu_unmap_memory((uint8_t*)dst_buf,map_size);
             ALOGE("%s %s %d: IOCTL_X2D_START_COMPOSE failed", __FILE__, __FUNCTION__, __LINE__);
             return ;
         }
-
-        ret = dmmu_unmap_user_memory(&dst_dmmu);
-        if (ret < 0) {
-            ALOGE("%s %s %d: dmmu_unmap_user_memory failed", __FILE__, __FUNCTION__, __LINE__);
-            return;
-        }
-    
+        dmmu_unmap_memory((uint8_t*)dst_buf,map_size);
     }
 
     void CameraHal1::ipu_convert_dataformat(CameraYUVMeta* yuvMeta,
@@ -2101,23 +2184,45 @@ namespace android{
         struct ipu_data_buffer* dstBuf;
 
         int err = 0;
+        static int oldzoomval = 0;
+        int must_do = 0;
+        int bytes_per_pixel = 2;
+        int cropLeft = 0;
+        int cropTop = 0;
+        int offset = 0;
+        int map_size = 0;
 
         if (ipu_open_status == false) {
             ALOGE("%s: open ipu error or not open it", __FUNCTION__);
             return;
         }
 
-        IMG_native_handle_t* dst_handle = NULL;
-        dst_handle = (IMG_native_handle_t*)(*buffer);
+        map_size = mPreviewWinWidth * mPreviewWinHeight * mPrebytesPerPixel;
+        dmmu_map_memory((uint8_t*)dst_buf,map_size);
 
-        struct dmmu_mem_info dst_dmmu;
-        dst_dmmu.vaddr = (void*)dst_buf;
-        dst_dmmu.size = dst_handle->iHeight * dst_handle->iStride * (dst_handle->uiBpp >> 3);
-        int ret = 0;
-        ret = dmmu_map_user_memory(&dst_dmmu);
-        if (ret != 0) {
-            ALOGE("%s: dmmu map user memory ret = %d",__FUNCTION__, ret);
-            return ;
+        mDevice->flushCache((void*)yuvMeta->yAddr, map_size);
+        mzoomVal = mJzParameters->getCameraParameters().getInt(CameraParameters::KEY_ZOOM);
+        switch(mzoomVal){
+        case 0:
+            mzoomRadio = 100;
+            break;
+        case 1:
+            mzoomRadio = 200;
+            break;
+        case 2:
+            mzoomRadio = 250;
+            break;
+        case 3:
+            mzoomRadio = 250;
+            break;
+        case 4:
+            mzoomRadio = 400;
+            break;
+        }
+
+        if(mzoomVal != oldzoomval){
+            oldzoomval = mzoomVal;
+            must_do = 1;
         }
 
         srcInfo = &(mipu->src_info);
@@ -2125,16 +2230,26 @@ namespace android{
         memset(srcInfo, 0, sizeof(struct source_data_info));
         srcInfo->fmt = yuvMeta->format;
         srcInfo->is_virt_buf = 1;
-        srcInfo->width = yuvMeta->width;
-        srcInfo->height = yuvMeta->height;
+        srcInfo->width = num2even(yuvMeta->width * 100 / mzoomRadio);
+        srcInfo->height = num2even(yuvMeta->height * 100 / mzoomRadio);
         srcInfo->stlb_base = mDevice->getTlbBase();
+
+        cropLeft = num2even((mPreviewWinWidth - srcInfo->width) / 2);
+        cropLeft = (cropLeft < 0) ? 0 : cropLeft;
+        cropTop = num2even((mPreviewWinHeight - srcInfo->height) / 2);
+        cropTop = (cropTop < 0) ? 0 : cropTop;
+        offset = (cropTop * mPreviewWinWidth + cropLeft) * bytes_per_pixel;
+        offset = (offset < 0) ? 0 : offset;
+        ALOGV("srcInfo->width = %d, srcInfo->height = %d, cropLeft =%d, cropTop = %d, offset = %d, mzoomRadio: %d",
+               srcInfo->width, srcInfo->height, cropLeft, cropTop, offset, mzoomRadio);
+
         if (yuvMeta->format == HAL_PIXEL_FORMAT_YCbCr_422_I) {
-            srcBuf->y_buf_v = (void*)yuvMeta->yAddr;
-            srcBuf->u_buf_v = (void*)yuvMeta->yAddr;
-            srcBuf->v_buf_v = (void*)yuvMeta->yAddr;
+            srcBuf->y_buf_v = (void*)(yuvMeta->yAddr + offset);
+            srcBuf->u_buf_v = (void*)(yuvMeta->yAddr + offset);
+            srcBuf->v_buf_v = (void*)(yuvMeta->yAddr + offset);
 
             if (mDevice->usePmem()) {
-                srcBuf->y_buf_phys = yuvMeta->yPhy; 
+                srcBuf->y_buf_phys = yuvMeta->yPhy + offset; 
                 srcBuf->u_buf_phys = 0;
                 srcBuf->v_buf_phys = 0;
             } else {
@@ -2148,7 +2263,7 @@ namespace android{
             srcBuf->v_stride = yuvMeta->vStride;
         } else if (yuvMeta->format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) {
             srcBuf->y_buf_v = (void*)yuvMeta->yAddr;
-            srcBuf->u_buf_v = (void*)(yuvMeta->yAddr + yuvMeta->width*yuvMeta->height) ;
+            srcBuf->u_buf_v = (void*)(yuvMeta->yAddr + (yuvMeta->width*yuvMeta->height)) ;
             srcBuf->v_buf_v = (void*)srcBuf->u_buf_v;
             srcBuf->y_stride = yuvMeta->yStride;
             srcBuf->u_stride = yuvMeta->uStride;
@@ -2173,6 +2288,7 @@ namespace android{
             srcBuf->v_stride = yuvMeta->vStride;
         } else {
             ALOGE("%s: preview format %d not support",__FUNCTION__, mCurrentFrame->format);
+            dmmu_unmap_memory((uint8_t*)dst_buf,map_size);
             return;
         }
 
@@ -2181,36 +2297,211 @@ namespace android{
         memset(dstInfo, 0, sizeof(struct dest_data_info));
 
         dstInfo->dst_mode = IPU_OUTPUT_TO_FRAMEBUFFER | IPU_OUTPUT_BLOCK_MODE;
-        dstInfo->fmt = dst_handle->iFormat;
+        dstInfo->fmt = mPreviewWinFmt;
         dstInfo->dtlb_base = mDevice->getTlbBase();
 
         dstInfo->left = 0;
         dstInfo->top = 0;
-        dstInfo->width = dst_handle->iWidth;
-        dstInfo->height = dst_handle->iHeight;
+        dstInfo->width = mPreviewWinWidth;
+        dstInfo->height = mPreviewWinHeight;
+
         dstInfo->out_buf_v = dst_buf;
         dstBuf->y_buf_v = (void*)(dst_buf);
-        dstBuf->y_stride = dst_handle->iStride * (dst_handle->uiBpp >> 3);
-
-        if (init_ipu_dev(yuvMeta->width, yuvMeta->height, yuvMeta->format) < 0) {
-            ALOGE("%s: ipu init failed ipuHalder",__FUNCTION__);
-            dmmu_unmap_user_memory(&dst_dmmu);
+        dstBuf->y_stride = mPreviewWinWidth * mPrebytesPerPixel;
+        err = init_ipu_dev(yuvMeta->width, yuvMeta->height, yuvMeta->format, must_do);
+        if (err < 0) {
+            ALOGE("ipu init failed ipuHalder = %p", mipu);
+            dmmu_unmap_memory((uint8_t*)dst_buf,map_size);
             return;
+        }
+        ipu_postBuffer(mipu);
+        dmmu_unmap_memory((uint8_t*)dst_buf,map_size);
+    }
+
+    status_t CameraHal1::ipu_zoomIn_scale(uint8_t* dest, int dest_width, int dest_height,
+                                          uint8_t* src, int src_width, int src_height, int src_format,
+                                          int stride_mul, int src_stride) {
+
+        struct source_data_info *srcInfo;
+        struct ipu_data_buffer* srcBuf;
+        struct dest_data_info* dstInfo;
+        struct ipu_data_buffer* dstBuf;
+
+        int err = 0;
+        int stride_shift = 0;
+        int must_do = 0;
+        int map_size = 0;
+        static int oldzoomval = 0;
+
+        if (ipu_open_status == false) {
+            ALOGE("%s: open ipu error or not open it", __FUNCTION__);
+            return BAD_VALUE;
+        }
+
+        if (src_format != HAL_PIXEL_FORMAT_YCbCr_422_I
+            && src_format != HAL_PIXEL_FORMAT_JZ_YUV_420_P
+            && src_format != HAL_PIXEL_FORMAT_YV12
+            && src_format != HAL_PIXEL_FORMAT_JZ_YUV_420_B) {
+            ALOGE("%s: don't support format 0x%x for up scale",__FUNCTION__,
+                  src_format);
+            return BAD_VALUE;
+        }
+
+        if(stride_mul == 2){
+            stride_shift = 1;
+            must_do = 1;
+        }else{
+            stride_shift = 0;
+            if((mzoomVal == 1) && (dest_width == 1600)) {
+                must_do = 1;
+            } else {
+                must_do = 0;
+            }
+        }
+
+        srcInfo = &(mipu->src_info);
+        srcBuf = &(mipu->src_info.srcBuf);
+        memset(srcInfo, 0, sizeof(struct source_data_info));
+        srcInfo->fmt = src_format;
+        srcInfo->is_virt_buf = 1;
+        srcInfo->width = src_width;
+        srcInfo->height = src_height;
+        srcInfo->stlb_base = mDevice->getTlbBase();
+
+        if (src_format == HAL_PIXEL_FORMAT_YV12
+            || src_format == HAL_PIXEL_FORMAT_JZ_YUV_420_P) {
+            srcBuf->y_buf_v = (void*)src;
+            srcBuf->u_buf_v = (void*)(src + src_width*src_height);
+            srcBuf->v_buf_v = (void*)((uint8_t*)srcBuf->u_buf_v + (src_width*src_height>>2));
+            srcBuf->y_stride = src_width;
+            srcBuf->u_stride = src_width>>1;
+            srcBuf->v_stride = src_width>>1;
+        } else if (src_format == HAL_PIXEL_FORMAT_YCbCr_422_I) {
+            srcBuf->y_buf_v = (void*)src;
+            srcBuf->u_buf_v = (void*)src;
+            srcBuf->v_buf_v = (void*)src;
+            srcBuf->y_stride = src_stride<<1 << stride_shift;
+            srcBuf->u_stride = src_stride<<1 << stride_shift;
+            srcBuf->v_stride = src_stride<<1 << stride_shift;
+        } else if (src_format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) {
+            srcBuf->y_buf_v = (void*)src;
+            srcBuf->u_buf_v = (void*)(src + (src_width*src_height));
+            srcBuf->v_buf_v = srcBuf->u_buf_v;
+            srcBuf->y_stride = src_width;
+            srcBuf->u_stride = src_width>>1;
+            srcBuf->v_stride = src_width>>1;
+        }
+        //-----------------------------
+        map_size = dest_width * dest_height * 2;
+        dmmu_map_memory((uint8_t*)dest,map_size);
+
+        mDevice->flushCache((void*)src, map_size);
+
+        dstInfo = &(mipu->dst_info);
+        dstBuf = &(dstInfo->dstBuf);
+        memset(dstInfo, 0, sizeof(struct dest_data_info));
+        dstInfo->dst_mode = IPU_OUTPUT_TO_FRAMEBUFFER
+            | IPU_OUTPUT_BLOCK_MODE;
+        dstInfo->fmt = src_format;
+        dstInfo->dtlb_base = mDevice->getTlbBase();
+
+        dstInfo->left = 0;
+        dstInfo->top = 0;
+        dstInfo->width = dest_width;
+        dstInfo->height = dest_height;
+        dstInfo->out_buf_v = dest;
+        if (src_format == HAL_PIXEL_FORMAT_YCbCr_422_I) {
+            dstBuf->y_buf_v = (void*)(dest);
+            dstBuf->u_buf_v = (void*)(dest);
+            dstBuf->v_buf_v = (void*)(dest);
+            dstBuf->y_stride = dest_width<<1 << stride_shift;
+            dstBuf->u_stride = dest_width<<1 << stride_shift;
+            dstBuf->v_stride = dest_width<<1 << stride_shift;
+        } else if (src_format == HAL_PIXEL_FORMAT_JZ_YUV_420_P
+                   || src_format == HAL_PIXEL_FORMAT_YV12) {
+            dstBuf->y_buf_v = (void*)(dest);
+            dstBuf->u_buf_v = (void*)(dest + dest_width*dest_height);
+            dstBuf->v_buf_v = (void*)((uint8_t*)dstBuf->u_buf_v + (dest_width*dest_height>>2));
+            dstBuf->y_stride = dest_width;
+            dstBuf->u_stride = dest_width>>1;
+            dstBuf->v_stride = dest_width>>1;
+        } else if (src_format == HAL_PIXEL_FORMAT_JZ_YUV_420_B) {
+            dstBuf->y_buf_v = (void*)(dest);
+            dstBuf->u_buf_v = (void*)(dest + dest_width*dest_height);
+            dstBuf->v_buf_v = dstBuf->u_buf_v;
+            dstBuf->y_stride = dest_width;
+            dstBuf->u_stride = dest_width>>1;
+            dstBuf->v_stride = dest_width>>1;
+        }
+
+        err = init_ipu_dev(src_width,src_height,src_format, must_do);
+        if (err < 0) {
+            ALOGE("ipu init failed ipuHalder = %p", mipu);
+            dmmu_unmap_memory((uint8_t*)dest,map_size);
+            return BAD_VALUE;
         }
 
         ipu_postBuffer(mipu);
-        dmmu_unmap_user_memory(&dst_dmmu);
+        dmmu_unmap_memory((uint8_t*)dest,map_size);
+        return NO_ERROR;
     }
 
-    int CameraHal1::open_ipu_dev(void) {
+    void CameraHal1::open_ipu_dev(void) {
+
+        if (ipu_open_status)
+            return;
+
         if (ipu_open(&mipu) < 0) {
             ALOGE("ipu_open() failed ipuHandler");
-            ipu_close(&mipu);
+            if (mipu != NULL) ipu_close(&mipu);
             mipu = NULL;
-            return -1;
+            ipu_open_status = false;
+            init_ipu_first = true;
+            return ;
         }
+
         ipu_open_status = true;
-        first_init_ipu = true;
+        init_ipu_first = true;
+        return ;
+    }
+
+    int CameraHal1::init_ipu_dev(int w, int h, int mat, int must_do) {
+
+        static int width = 0;
+        static int height= 0;
+        static int format = 0;
+
+        if (!ipu_open_status)
+            return -1;
+
+        if (init_ipu_first) {
+            init_ipu_first = false;
+            width = 0;
+            height = 0;
+            format = 0;
+        }
+
+        if (w != width || h != height || mat != format || must_do != 0) {
+
+            width = w;
+            height = h;
+            format = mat;
+
+            ALOGV("%s: width: %d, height: %d, format: 0x%x,must_do: %d",
+                  __FUNCTION__, width, height, format,must_do);
+
+            if((mzoomVal == 1) && (must_do == 1) && (w == 800))
+                init_ipu_first = true;
+
+            if (ipu_init(mipu) < 0) {
+                if (mipu != NULL) ipu_close(&mipu);
+                mipu = NULL;
+                ipu_open_status = false;
+                init_ipu_first = true;
+                ALOGE("%s: ipu init fail",__FUNCTION__);
+                return -1;
+            }
+        }
         return 0;
     }
 
@@ -2222,238 +2513,54 @@ namespace android{
             return;
 
         int err = 0;
-        err = ipu_close(&mipu);
+        if (mipu != NULL) err = ipu_close(&mipu);
         if (err < 0) {
-            ALOGE("%s: ipu_close failed ipuHalder", __FUNCTION__);
+            ALOGE("ipu_close failed ipuHalder = %p", mipu);
         }
         mipu = NULL;
         ipu_open_status = false;
-        first_init_ipu = true;
+        init_ipu_first = true;
     }
 
-    int CameraHal1::init_ipu_dev(int w, int h, int f) {
-        static int width = 0;
-        static int height = 0;
-        static int format = 0;
+    void CameraHal1::open_x2d_dev(void) {
 
-        if (first_init_ipu) {
-            first_init_ipu = false;
-            width = 0;
-            height = 0;
-            format = 0;
+        x2d_fd = open (X2D_NAME, O_RDWR);
+        if (x2d_fd < 0) {
+            ALOGE("%s: open %s error, %s",
+                  __FUNCTION__, X2D_NAME, strerror(errno));
         }
-
-        if (w != width || h != height || f != format) {
-            width = w;
-            height = h;
-            format = f;
-
-            if (ipu_init(mipu) < 0) {
-                close_ipu_dev();
-                return -1;
-            }
-        }
-        return 0;
     }
 
-    status_t CameraHal1::WorkThread::stopThread() {
+    void CameraHal1::close_x2d_dev(void) {
 
-        mCameraHal->camera_state_lock.lock();
+        AutoMutex lock(mlock);
 
-        if ( mCameraHal->camera_state == CAMERA_NONE ) {
-            mCameraHal->camera_state_lock.unlock();
-            requestExitAndWait();
-            return NO_ERROR;
+        if (x2d_fd > 0) {
+            close(x2d_fd);
+            x2d_fd = -1;
         }
-
-        if ( mCameraHal->camera_state == START_CAPTURE ||
-             mCameraHal->camera_state == RUN_CAPTURE ) {
-            mCameraHal->prev_camera_state = mCameraHal->camera_state;
-            mCameraHal->camera_state = STOP_CAPTURE;
-            mCameraHal->camera_state_lock.unlock();
-            requestExitAndWait();
-            mCameraHal->prev_camera_state = mCameraHal->camera_state;
-            mCameraHal->camera_state = CAMERA_NONE;
-            return NO_ERROR;
-        }
-
-        if (mCameraHal->camera_state == START_PREVIEW ||
-            mCameraHal->camera_state == RUN_PREVIEW) {
-
-            ALOGE_IF(DEBUG_HAL1,"stopThread, stop preview");
-            mCameraHal->prev_camera_state = mCameraHal->camera_state;
-            mCameraHal->camera_state = STOP_PREVIEW;
-            mCameraHal->camera_state_lock.unlock();
-            ALOGE_IF(DEBUG_HAL1,"requestExitandWait");
-            requestExitAndWait();
-            mCameraHal->prev_camera_state = mCameraHal->camera_state;
-            mCameraHal->camera_state = CAMERA_NONE;
-            return NO_ERROR;
-        }
-
-        if ( mCameraHal->camera_state == STOP_PREVIEW || mCameraHal->camera_state == STOP_CAPTURE) {
-            mCameraHal->camera_state_lock.unlock();
-            requestExitAndWait();
-            mCameraHal->prev_camera_state = mCameraHal->camera_state;
-            mCameraHal->camera_state = CAMERA_NONE;
-            return NO_ERROR;
-        }
-
-        mCameraHal->camera_state_lock.unlock();
-        return NO_ERROR;
     }
 
+    void CameraHal1::dump_data(bool isdump) {
 
-    bool CameraHal1::WorkThread::threadLoop() {
+        static int j = 0;
 
-        status_t res = NO_ERROR;
-        mCameraHal->camera_state_lock.lock();
-        if ( mCameraHal->camera_state == START_CAPTURE ) {
-            mCameraHal->camera_state_lock.unlock();
-            res = mCameraHal->readyToCapture();
-            if ( res != NO_ERROR ) {
-                ALOGE("readyToCapture failed");
-                mCameraHal->camera_state_lock.lock();
-                mCameraHal->prev_camera_state = mCameraHal->camera_state;
-                mCameraHal->camera_state = CAMERA_NONE;
-                mCameraHal->camera_state_lock.unlock();
-                return false;
+        if (!isdump)
+            return;
+
+        if (j < 10 ) {
+            int size = getCurrentFrameSize();
+            char filename1[20] = {0};
+            sprintf(filename1, "/data/vpu/cameraHalb%d-%x.raw",j++,mCurrentFrame->yAddr);
+            FILE* fp = fopen(filename1, "w+");
+
+            if (fp != NULL) {
+                fwrite((uint8_t*)(mCurrentFrame->yAddr), size,1, fp);
+                fclose(fp);
+                fp = NULL;
             }
-            mCameraHal->camera_state_lock.lock();
-            if ( mCameraHal->camera_state == STOP_CAPTURE ) {
-
-                mCameraHal->camera_state_lock.unlock();
-                ALOGE_IF(DEBUG_HAL1,"threadLoop free capture");
-                mCameraHal->getDevice()->sendCommand(STOP_PICTURE);
-                mCameraHal->getDevice()->freeStream(CAPTURE_BUFFER);
-
-                mCameraHal->camera_state_lock.lock();
-                mCameraHal->prev_camera_state = mCameraHal->camera_state;
-                mCameraHal->camera_state = CAMERA_NONE;
-                mCameraHal->camera_state_lock.unlock();
-                return false;
-            }
-            mCameraHal->prev_camera_state = mCameraHal->camera_state;
-            mCameraHal->camera_state = RUN_CAPTURE;
-            mCameraHal->camera_state_lock.unlock();
-            return true;
         }
-        else if (mCameraHal->camera_state == RUN_CAPTURE) {
-            mCameraHal->camera_state_lock.unlock();
-            if (mCameraHal->thread_body_capture()) {
 
-                ALOGE_IF(DEBUG_HAL1,"threadLoop free capture");
-                mCameraHal->getDevice()->sendCommand(STOP_PICTURE);
-                usleep(10000);
-                mCameraHal->getDevice()->freeStream(CAPTURE_BUFFER);
-
-                mCameraHal->camera_state_lock.lock();
-                mCameraHal->prev_camera_state = mCameraHal->camera_state;
-                mCameraHal->camera_state = STOP_CAPTURE;
-                mCameraHal->camera_state_lock.unlock();
-
-                return false;
-            }
-            else {
-                ALOGE("capture error");
-                mCameraHal->getDevice()->sendCommand(STOP_PICTURE);
-                mCameraHal->getDevice()->freeStream(CAPTURE_BUFFER);
-
-                mCameraHal->camera_state_lock.lock();
-                mCameraHal->prev_camera_state = mCameraHal->camera_state;
-                mCameraHal->camera_state = CAMERA_NONE;
-                mCameraHal->camera_state_lock.unlock();
-                return false;
-            }
-        } else if (mCameraHal->camera_state == START_PREVIEW) {
-            mCameraHal->camera_state_lock.unlock();
-            res = mCameraHal->readyToPreview();
-            if ( res != NO_ERROR ) {
-                ALOGE("ready to preview failed");
-                return false;
-            }
-            mCameraHal->camera_state_lock.lock();
-            if ( mCameraHal->camera_state == STOP_PREVIEW ) {
-                mCameraHal->camera_state_lock.unlock();
-                ALOGE_IF(DEBUG_HAL1,"threadLoop: camera_state = %d stop_preview", 
-                         mCameraHal->camera_state);
-                mCameraHal->freePreview();
-                mCameraHal->camera_state_lock.lock();
-                mCameraHal->prev_camera_state = mCameraHal->camera_state;
-                mCameraHal->camera_state = CAMERA_NONE;
-                mCameraHal->camera_state_lock.unlock();
-                return false;
-            }
-            mCameraHal->prev_camera_state = mCameraHal->camera_state;
-            mCameraHal->camera_state = RUN_PREVIEW;
-            mCameraHal->camera_state_lock.unlock();
-            return true;
-        } else if (mCameraHal->camera_state == RUN_PREVIEW ) {
-            mCameraHal->camera_state_lock.unlock();
-            if (mCameraHal->thread_body_preview()) {
-
-                mCameraHal->camera_state_lock.lock();
-                if ( mCameraHal->camera_state == STOP_PREVIEW ) {
-                    mCameraHal->camera_state_lock.unlock();
-                    ALOGE_IF(DEBUG_HAL1,"threadLoop: camera_state = %d stop_preview", 
-                             mCameraHal->camera_state);
-                    mCameraHal->freePreview();
-                    mCameraHal->camera_state_lock.lock();
-                    mCameraHal->prev_camera_state = mCameraHal->camera_state;
-                    mCameraHal->camera_state = CAMERA_NONE;
-                    mCameraHal->camera_state_lock.unlock();
-                    return false;
-
-                }
-                mCameraHal->camera_state_lock.unlock();
-                return !mOnce;
-            }
-            else {
-                ALOGE_IF(DEBUG_HAL1,"threadLoop: camera_state = %d preview error", mCameraHal->camera_state);
-                mCameraHal->freePreview();
-                mCameraHal->camera_state_lock.lock();
-                mCameraHal->prev_camera_state = mCameraHal->camera_state;
-                mCameraHal->camera_state = CAMERA_NONE;
-                mCameraHal->camera_state_lock.unlock();
-                return false;
-            }
-        } 
-        else if ( mCameraHal->camera_state == STOP_PREVIEW ) {
-
-            if (mCameraHal->prev_camera_state == RUN_PREVIEW) {
-                mCameraHal->camera_state_lock.unlock();
-                mCameraHal->freePreview();
-                mCameraHal->camera_state_lock.lock();
-                mCameraHal->prev_camera_state = mCameraHal->camera_state;
-                mCameraHal->camera_state = CAMERA_NONE;
-                mCameraHal->camera_state_lock.unlock();
-                return false;
-            }
-
-            mCameraHal->prev_camera_state = mCameraHal->camera_state;
-            mCameraHal->camera_state = CAMERA_NONE;
-            mCameraHal->camera_state_lock.unlock();
-            return false;
-        }
-        else if ( mCameraHal->camera_state == STOP_CAPTURE ) {
-
-            if (mCameraHal->prev_camera_state == RUN_CAPTURE) {
-                mCameraHal->camera_state_lock.unlock();
-                mCameraHal->getDevice()->sendCommand(STOP_PICTURE);
-                mCameraHal->getDevice()->freeStream(CAPTURE_BUFFER);
-                mCameraHal->camera_state_lock.lock();
-                mCameraHal->prev_camera_state = mCameraHal->camera_state;
-                mCameraHal->camera_state = CAMERA_NONE;
-                mCameraHal->camera_state_lock.unlock();
-                return false;
-            }
-            mCameraHal->prev_camera_state = mCameraHal->camera_state;
-            mCameraHal->camera_state = CAMERA_NONE;
-            mCameraHal->camera_state_lock.unlock();
-            return false;
-        }
-        mCameraHal->camera_state_lock.unlock();
-        return false;
     }
 
     //------------------------------------------------------------------//
@@ -2739,5 +2846,39 @@ namespace android{
             return NO_MEMORY;
         }
         return ch1->deviceClose();
+    }
+
+    CameraHal1::WorkThread::ControlCmd 
+    CameraHal1::WorkThread::receiveCmd(int fd, int64_t timeout) {
+
+        fd_set fds[1];
+        struct timeval tv;
+
+        const int fd_num = (fd >= 0) ? MAX(fd, mControlFd) + 1:
+            mControlFd + 1;
+
+        FD_ZERO(fds);
+        FD_SET(mControlFd,fds);
+        if (fd >= 0)
+            FD_SET(fd, fds);
+
+        if (timeout > 0 && ((timeout/1000) > 1000)) {
+            tv.tv_sec = timeout / 1000000000LL;
+            tv.tv_usec = (timeout % 1000000000LL)/1000;
+        } else {
+            tv.tv_sec = 0;
+            tv.tv_usec = 0;
+        }
+
+        int res = select(fd_num, fds, NULL, NULL, &tv);
+        if ((res > 0) && FD_ISSET(mControlFd, fds)) {
+            ControlCmd msg;
+            res = read(mControlFd, &msg, sizeof(msg));
+            if (res == sizeof(msg))
+                return msg;
+        }
+        if (res == 0)
+            return THREAD_TIMEOUT;
+        return THREAD_ERROR;
     }
 }; // end namespace

@@ -10,8 +10,7 @@
  * published by the Free Software Foundation.
  */
 #define LOG_TAG "JZCameraParameters2"
-#define DEBUG_JZP2 1
-
+//#define LOG_NDEBUG 0
 #include "JZCameraParameters2.h"
 
 #define ENTRY_CAPACITY 27
@@ -190,7 +189,7 @@ namespace android {
     }
 
     const camera_metadata_t* JZCameraParameters2::get_camera_metadata(void) {
-        ALOGE_IF(DEBUG_JZP2,"%s: Id: %d",__FUNCTION__, mCameraId);
+        ALOGV("%s: Id: %d",__FUNCTION__, mCameraId);
         return mPreviewMetaDataBuffer;
     }
 
@@ -302,7 +301,7 @@ namespace android {
     //private method
     void JZCameraParameters2::setCommonMode(void) {
 
-        ALOGE_IF(DEBUG_JZP2,"%s: camera %d",__FUNCTION__, mCameraId);
+        ALOGV("%s: camera %d",__FUNCTION__, mCameraId);
 
         mDevice->setCommonMode(WHITE_BALANCE, mwbMode);
         mDevice->setCommonMode(EFFECT_MODE, meffectMode);
@@ -318,20 +317,11 @@ namespace android {
 
         memset(&p, 0, sizeof (struct camera_param));
 
-        ALOGE_IF(DEBUG_JZP2,"%s: camera %d",__FUNCTION__, mCameraId);
+        ALOGV("%s: camera %d",__FUNCTION__, mCameraId);
 
-        p.cmd = CPCMD_SET_PREVIEW_RESOLUTION;
+        p.cmd = CPCMD_SET_RESOLUTION;
         p.param.ptable[0].w = mPreviewWidth;
         p.param.ptable[0].h = mPreviewHeight;
-        p.param.bpp = 2;
-        p.param.format = mPreviewFormat;
-        mDevice->setCameraParam(p, mPreviewFps);
-
-        p.cmd = CPCMD_SET_CAPTURE_RESOLUTION;
-        p.param.ctable[0].w = mCaptureWidth;
-        p.param.ctable[0].h = mCaptureHeight;
-        p.param.bpp = 2;
-        p.param.format = mCaptureFormat;
         mDevice->setCameraParam(p, mPreviewFps);
     }
 
@@ -413,7 +403,7 @@ namespace android {
     void JZCameraParameters2::initDefaultParameters(int facing) {
         status_t res;
 
-        ALOGE_IF(DEBUG_JZP2,"%s: Id: %d, facing: %d",__FUNCTION__, mCameraId, facing);
+        ALOGV("%s: Id: %d, facing: %d",__FUNCTION__, mCameraId, facing);
 
         CameraMetadata* tmpInfo = new CameraMetadata(ENTRY_CAPACITY, DATA_CAPACITY);
 
@@ -463,7 +453,7 @@ namespace android {
             goto update_error;
         }
 
-        ALOGE_IF(DEBUG_JZP2,"%s: camera %d init face detect mode %d",__FUNCTION__,
+        ALOGV("%s: camera %d init face detect mode %d",__FUNCTION__,
                  mCameraId, int8containers[0]);
 
         containers[0] = atoi(CAMERA_FACEDETECT);
@@ -490,7 +480,7 @@ namespace android {
         }
         
 
-        ALOGE_IF(DEBUG_JZP2,"%s: camera %d init max face %d",__FUNCTION__,
+        ALOGV("%s: camera %d init max face %d",__FUNCTION__,
                  mCameraId, containers[0]);
 
         mDevice->getSensorInfo(&sinfo,&rinfo);
@@ -499,7 +489,7 @@ namespace android {
                 break;
             containers[i] = rinfo.ptable[j].w;
             containers[i+1] = rinfo.ptable[j].h;
-            ALOGE_IF(DEBUG_JZP2,"%s: (%d): support preview size: %dx%d",__FUNCTION__, j, rinfo.ptable[i].w, rinfo.ptable[i].h);
+            ALOGV("%s: (%d): support preview size: %dx%d",__FUNCTION__, j, rinfo.ptable[i].w, rinfo.ptable[i].h);
             j++;
         }
 
@@ -514,9 +504,9 @@ namespace android {
 
         mPreviewWidth = containers[0];
         mPreviewHeight = containers[1];
-        mPreviewFormat = PIXEL_FORMAT_JZ_YUV420P;
+        mPreviewFormat = PIXEL_FORMAT_YUV422I;
 
-        ALOGE_IF(DEBUG_JZP2,"%s: camera %d preview size %dx%d, format %d",__FUNCTION__,
+        ALOGV("%s: camera %d preview size %dx%d, format %d",__FUNCTION__,
                  mCameraId, mPreviewWidth, mPreviewHeight, mPreviewFormat);
 
         //build fast info
@@ -536,7 +526,7 @@ namespace android {
           goto update_error;
         }
 
-        ALOGE_IF(DEBUG_JZP2, "%s: camera %d array size %dx%d",__FUNCTION__,
+        ALOGV( "%s: camera %d array size %dx%d",__FUNCTION__,
                  mCameraId, containers[0], containers[1]);
 
         containers[0] = 10;
@@ -556,7 +546,7 @@ namespace android {
 
         mPreviewFps = containers[7];
 
-        ALOGE_IF(DEBUG_JZP2,"%s: camera %d fps ranges: %d, %d",__FUNCTION__, mCameraId,
+        ALOGV("%s: camera %d fps ranges: %d, %d",__FUNCTION__, mCameraId,
                  containers[0]*1000, containers[1]*1000);
 
         containers[0] = HAL_PIXEL_FORMAT_YCbCr_422_I;
@@ -573,38 +563,22 @@ namespace android {
             goto update_error;
         }
 
-        ALOGE_IF(DEBUG_JZP2,"%s, camera %d preview format: yuv422i, yuv422sp, yuv420p, yuv420B, yuv420sp, jzyuv420p",
+        ALOGV("%s, camera %d preview format: yuv422i, yuv422sp, yuv420p, yuv420B, yuv420sp, jzyuv420p",
                  __FUNCTION__, mCameraId);
 
         for (size_t i = 0, j = 0; i < CONTAINER_CAP; i += 2) {
-            if (j == sinfo.cap_resolution_nr)
+            if (j == sinfo.prev_resolution_nr)
                 break;
-            containers[i] = rinfo.ctable[j].w;
-            containers[i+1] = rinfo.ctable[j].h;
-            ALOGE_IF(DEBUG_JZP2,"%s: (%d): supported capture size: %dx%d",
+            containers[i] = rinfo.ptable[j].w;
+            containers[i+1] = rinfo.ptable[j].h;
+            ALOGV("%s: (%d): supported capture size: %dx%d",
                      __FUNCTION__, j, containers[i], containers[i+1]);
             j++;
         }
 
-        res = getPropertyPictureSize((int*) &(containers[sinfo.cap_resolution_nr]),
-                                     (int*) &(containers[sinfo.cap_resolution_nr+1]));
-        if (res == OK) {
-            sinfo.cap_resolution_nr++;
-        }
-
-        if (if_need_picture_upscale()) {
-            int dst_w = getPropertyValue("ro.board.camera.upscale_dst_w");
-            int dst_h = getPropertyValue("ro.board.camera.upscale_dst_h");
-            if (dst_w > 0 && dst_h > 0) {
-                containers[sinfo.cap_resolution_nr] = dst_w;
-                containers[sinfo.cap_resolution_nr+1] = dst_h;
-                sinfo.cap_resolution_nr++;
-            }
-        }
-
-        if (sinfo.cap_resolution_nr >= 1) {
+        if (sinfo.prev_resolution_nr >= 1) {
             res = tmpInfo->update(ANDROID_SCALER_AVAILABLE_JPEG_SIZES,
-                                  (const int32_t*)containers, sinfo.cap_resolution_nr);
+                                  (const int32_t*)containers, sinfo.prev_resolution_nr);
             if (res != OK) {
                 ALOGE("%s: camera %d init capture size error.",__FUNCTION__, mCameraId);
                 goto update_error;
@@ -613,14 +587,9 @@ namespace android {
 
         mCaptureWidth = containers[0];
         mCaptureHeight = containers[1];
-#ifdef COMPRESS_JPEG_USE_HW
-        mCaptureFormat = PIXEL_FORMAT_JZ_YUV420T;
-#else
-        mCaptureFormat = PIXEL_FORMAT_YUV422I;
-#endif
 
-        ALOGE_IF(DEBUG_JZP2,"%s: camera %d capture size %dx%d, format %d",__FUNCTION__, mCameraId,
-                 mCaptureWidth, mCaptureHeight, mCaptureFormat);
+        ALOGV("%s: camera %d capture size %dx%d",__FUNCTION__, mCameraId,
+                 mCaptureWidth, mCaptureHeight);
 
         containers[0] = 0;
         containers[1] = 0;
@@ -765,7 +734,7 @@ namespace android {
             goto update_error;
         }
 
-        ALOGE_IF(DEBUG_JZP2,"%s: camera %d scaler aailable max zoom %f",__FUNCTION__,
+        ALOGV("%s: camera %d scaler aailable max zoom %f",__FUNCTION__,
                  mCameraId, floatcontainers[0]);
 
         containers[0] = 1;
@@ -786,7 +755,7 @@ namespace android {
             goto update_error;
         }
 
-        ALOGE_IF(DEBUG_JZP2,"%s: camera %d init trigger af with auto",__FUNCTION__,
+        ALOGV("%s: camera %d init trigger af with auto",__FUNCTION__,
                  mCameraId);
 
         int8containers[0] = 1;
@@ -798,7 +767,7 @@ namespace android {
             goto update_error;
         }
 
-        ALOGE_IF(DEBUG_JZP2,"%s: camera %d init use zsl format",__FUNCTION__,
+        ALOGV("%s: camera %d init use zsl format",__FUNCTION__,
                  mCameraId);
 
         int8containers[0] = 1;
@@ -810,10 +779,10 @@ namespace android {
             goto update_error;
         }
 
-        ALOGE_IF(DEBUG_JZP2,"%s: camera %d init metering crop region",__FUNCTION__,
+        ALOGV("%s: camera %d init metering crop region",__FUNCTION__,
                  mCameraId);
 
-        ALOGE_IF(DEBUG_JZP2,"%s camera %d init complete, entryCount: %d",__FUNCTION__,
+        ALOGV("%s camera %d init complete, entryCount: %d",__FUNCTION__,
                  mCameraId, tmpInfo->entryCount());
 
         //-------------- end construct -----------
@@ -873,7 +842,7 @@ namespace android {
     //Override parent method
     int JZCameraParameters2::setParameters2(camera_metadata_t* params) {
 
-        ALOGE_IF(DEBUG_JZP2,"%s: Id: %d, facing: %d",__FUNCTION__, mCameraId, mFacing);
+        ALOGV("%s: Id: %d, facing: %d",__FUNCTION__, mCameraId, mFacing);
 
         status_t ret = NO_ERROR;
         String8 tmpParameters;
@@ -884,7 +853,7 @@ namespace android {
     //Override parent method
     status_t JZCameraParameters2::setUpEXIF(ExifElementsTable* exifTable) {
 
-        ALOGE_IF(DEBUG_JZP2,"%s: Id: %d, facing: %d",__FUNCTION__, mCameraId, mFacing);
+        ALOGV("%s: Id: %d, facing: %d",__FUNCTION__, mCameraId, mFacing);
 
         status_t ret = NO_ERROR;
 

@@ -17,64 +17,56 @@
 
 namespace android {
 
-     typedef struct compress_params_hw{
-	  uint8_t* pictureYUV420_y;    //need to get in getPrameters()
-	  uint8_t* pictureYUV420_c;    //need to get in getPrameters()
-				
-	  int pictureWidth;
-	  int pictureHeight;
-	  int pictureQuality;  //0-85 LOW 85-95 MEDIUMS 95-100 HIGH 
+    typedef struct compress_params_hw{
+        uint8_t* pictureYUV420_y;    //need to get in getPrameters()
+        uint8_t* pictureYUV420_c;    //need to get in getPrameters()
 
-	  int thumbnailWidth;
-	  int thumbnailHeight;
-	  int thumbnailQuality;  //0-85 LOW 85-95 MEDIUMS 95-100 HIGH
+        int pictureWidth;
+        int pictureHeight;
+        int pictureQuality;  //0-85 LOW 85-95 MEDIUMS 95-100 HIGH 
 
-	  int format;
-				
-	  unsigned char* jpeg_out;
-	  int* jpeg_size;
-		
-	  unsigned char* th_jpeg_out;
-	  int* th_jpeg_size;
+        int thumbnailWidth;
+        int thumbnailHeight;
+        int thumbnailQuality;  //0-85 LOW 85-95 MEDIUMS 95-100 HIGH
 
-	  unsigned int tlb_addr;//need to get in getPrameters()
+        int format;
 
-	  camera_request_memory requiredMem;
-     }compress_params_hw_t;
+        unsigned char* jpeg_out;
+        int* jpeg_size;
 
-     typedef compress_params_hw_t* compress_params_hw_ptr;
+        unsigned char* th_jpeg_out;
+        int* th_jpeg_size;
 
-     class CameraCompressorHW {
+        unsigned int tlb_addr;//need to get in getPrameters()
 
-     private:
-	  compress_params_hw_t mcparamsHW;
+        camera_request_memory requiredMem;
+    }compress_params_hw_t;
 
-     public :
+    typedef compress_params_hw_t* compress_params_hw_ptr;
 
-	  CameraCompressorHW();
+    class CameraCompressorHW {
 
-	  virtual ~CameraCompressorHW(){};
+    private:
+        compress_params_hw_t mcparamsHW;
 
-	  int setPrameters(compress_params_hw_ptr hw_cinfo);
+    public :
+        CameraCompressorHW();
+        virtual ~CameraCompressorHW(){};
+        int setPrameters(compress_params_hw_ptr hw_cinfo);
+        int hw_compress_to_jpeg();
+        void yuv422i_to_yuv420_block(unsigned char *dsty,unsigned char *dstc,char *inyuv,int w,int h);
+        void camera_mem_free(struct camera_buffer* buf);
+        int camera_mem_alloc(struct camera_buffer* buf,int size,int nr);
+        void rgb565_to_jpeg(unsigned char* dest_img, int *dest_size, unsigned char* rgb,
+                                            int width, int height,int quality);
 
-	  int hw_compress_to_jpeg();
-
-	  void yuv422i_to_yuv420_block(unsigned char *dsty,unsigned char *dstc,char *inyuv,int w,int h);
-		
-	  void camera_mem_free(struct camera_buffer* buf);
-
-	  int camera_mem_alloc(struct camera_buffer* buf,int size,int nr);
-
-     private:
-
-	  int getpictureYuv420Data( unsigned char* yuv_y, unsigned char* yuv_c);
-		
-	  int getthumbnailYuv420Data(unsigned char* th_y, unsigned char* th_c);
-
-	  int put_image_jpeg(unsigned char* yuv_y, unsigned char* yuv_c, 
-			     unsigned char* bsa, unsigned int* reginfo, int w, int h,
-			     int quality, unsigned char* jpeg_out, int *size, unsigned int tlb_addr);
-     };
+    private:
+        int getpictureYuv420Data( unsigned char* yuv_y, unsigned char* yuv_c);
+        int getthumbnailYuv420Data(unsigned char* th_y, unsigned char* th_c);
+        int put_image_jpeg(unsigned char* yuv_y, unsigned char* yuv_c, 
+                           unsigned char* bsa, unsigned int* reginfo, int w, int h,
+                           int quality, unsigned char* jpeg_out, int *size, unsigned int tlb_addr);
+    };
 };
 
 

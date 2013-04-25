@@ -11,26 +11,24 @@
  */
 
 #define LOG_TAG "CameraFaceDetect"
-#define DEBUG_FACEDETECT 0
-
+//#define LOG_NDEBUG 0
 #include "CameraFaceDetect.h"
-
 
 namespace android {
 
-     Mutex CameraFaceDetect::sLock;
-     CameraFaceDetect* CameraFaceDetect::sInstance = NULL;
+    Mutex CameraFaceDetect::sLock;
+    CameraFaceDetect* CameraFaceDetect::sInstance = NULL;
 
-     CameraFaceDetect* CameraFaceDetect::getInstance() {
-          ALOGE_IF(DEBUG_FACEDETECT,"%s", __FUNCTION__);
-          Mutex::Autolock _l(sLock);
-          CameraFaceDetect* instance = sInstance;
-          if (instance == NULL) {
-               instance = new CameraFaceDetect();
-               sInstance = instance;
-          }
-          return instance;
-     }
+    CameraFaceDetect* CameraFaceDetect::getInstance() {
+        ALOGV("%s", __FUNCTION__);
+        Mutex::Autolock _l(sLock);
+        CameraFaceDetect* instance = sInstance;
+        if (instance == NULL) {
+            instance = new CameraFaceDetect();
+            sInstance = instance;
+        }
+        return instance;
+    }
 
     CameraFaceDetect::CameraFaceDetect() {
         memset(&mparam, 0, sizeof(struct face_detect_param));

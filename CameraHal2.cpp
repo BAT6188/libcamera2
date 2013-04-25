@@ -11,8 +11,7 @@
  */
 
 #define LOG_TAG "CameraHal2"
-#define DEBUG_HAL2 0
-
+//#define LOG_NDEBUG 0
 #include "CameraHalSelector.h"
 
 namespace android{
@@ -102,7 +101,7 @@ namespace android{
 
     int CameraHal2::get_number_cameras(void) {
 
-        ALOGE_IF(DEBUG_HAL2,"Enter %s : line=%d",__FUNCTION__,__LINE__);
+        ALOGV("Enter %s : line=%d",__FUNCTION__,__LINE__);
 
         if (NULL != mDevice) {
             return mDevice->getCameraNum();
@@ -130,7 +129,7 @@ namespace android{
     }
 
     void CameraHal2::initialize(void) {
-        ALOGE_IF(DEBUG_HAL2,"Enter %s : line=%d",__FUNCTION__,__LINE__);
+        ALOGV("Enter %s : line=%d",__FUNCTION__,__LINE__);
         mDevice->connectDevice(mcamera_id);
         mJzParameters2->initDefaultParameters(mirror?CAMERA_FACING_FRONT:CAMERA_FACING_BACK);
     }
@@ -138,7 +137,7 @@ namespace android{
     //-------------android 4.2 camera 2.0 api ----------
 
     int CameraHal2::set_Request_queue_src_ops(const camera2_request_queue_src_ops_t *request_src_ops) {
-        ALOGE_IF(DEBUG_HAL2,"%s: ",__FUNCTION__);
+        ALOGV("%s: ",__FUNCTION__);
         if ((NULL != request_src_ops) && (NULL != request_src_ops->dequeue_request)
             && (NULL != request_src_ops->free_request) && (NULL != request_src_ops->request_count)) {
             mRequest_src_ops = request_src_ops;
@@ -148,7 +147,7 @@ namespace android{
     }
 
     int CameraHal2::set_Frame_queue_dst_ops(const camera2_frame_queue_dst_ops_t *frame_dst_ops) {
-        ALOGE_IF(DEBUG_HAL2,"%s: ",__FUNCTION__);
+        ALOGV("%s: ",__FUNCTION__);
         if ((NULL != frame_dst_ops) && (NULL != frame_dst_ops->dequeue_frame)
             &&(NULL != frame_dst_ops->cancel_frame) && (NULL != frame_dst_ops->enqueue_frame)) {
             mFrame_dst_ops = frame_dst_ops;
@@ -158,7 +157,7 @@ namespace android{
     }
 
     int CameraHal2::notify_Request_queue_not_empty(void) {
-      ALOGE_IF(DEBUG_HAL2,"%s: ",__FUNCTION__);
+      ALOGV("%s: ",__FUNCTION__);
       if ((NULL == mFrame_dst_ops) || (NULL == mRequest_src_ops)) {
         ALOGE("%s: queue ops NULL, ignoring request",__FUNCTION__);
         return BAD_VALUE;
@@ -168,7 +167,7 @@ namespace android{
 
     int CameraHal2::get_In_progress_count(void) {
         AutoMutex lock(mLock);
-        ALOGE_IF(DEBUG_HAL2,"%s: ",__FUNCTION__); 
+        ALOGV("%s: ",__FUNCTION__); 
         return mRequestCount;
     }
 
@@ -214,7 +213,7 @@ namespace android{
                                     uint32_t *format_actual, // IGNORED, will be removed
                                     uint32_t *usage,
                                     uint32_t *max_buffers) {
-        ALOGE_IF(DEBUG_HAL2, "%s: stream %dx%d format: 0x%x", __FUNCTION__, width, height, format);
+        ALOGV("%s: stream %dx%d format: 0x%x", __FUNCTION__, width, height, format);
 
         if (((format == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED) || (format == CAMERA2_HAL_PIXEL_FORMAT_OPAQUE)) &&
             mJzParameters2->isSupportedResolution(width, height)) {

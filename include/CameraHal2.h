@@ -121,6 +121,10 @@ typedef struct substream_entry {
 
         int module_open(const hw_module_t* module, const char* id, hw_device_t** device);
 
+        bool getModuleInit() {
+            return mModuleOpened;
+        }
+
         int get_number_cameras(void);
 
         int get_cameras_info(int camera_id, struct camera_info* info);    

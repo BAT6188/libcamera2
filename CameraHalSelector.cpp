@@ -1,5 +1,5 @@
 /*
- * Camera HAL for Ingenic android 4.1
+ * Camera HAL for Ingenic android 4.2
  *
  * Copyright 2011 Ingenic Semiconductor LTD.
  *
@@ -11,161 +11,196 @@
  */
 
 #define LOG_TAG "CameraHalSelect"
-#define DEBUG_HALSELECT 0
-
+//#define LOG_NDEBUG 0
 #include "CameraHalSelector.h"
 #include <media/MediaProfiles.h>
-#include <CameraService.h>
 
 namespace android {
+    CameraHalSelector::CameraHalSelector()
+        :mLock("CameraHalSelector::Lock"),
+         mCameraNum(0),
+         mCurrentId(-1),
+         mversion(1),
+         device_selector(NULL),
+         mHal(NULL) {
 
-     CameraHalSelector::CameraHalSelector()
-          :mLock("CameraHalSelector::Lock"),           
-           mCameraNum(0),
-           mCurrentId(-1),
-           mversion(1),
-           device_selector(NULL),
-           mHal(NULL)
-     {
-          char prop[16];
-          int media_profile_camera_num = 0;
+        char prop[16];
+        int media_profile_camera_num = 0;
 
-          /**
-             start camera device
-          */
+        /**
+           start camera device
+        */
 
-          media_profile_camera_num = get_profile_number_cameras();
-          device_selector = new CameraDeviceSelector();
+        media_profile_camera_num = get_profile_number_cameras();
+        device_selector = new CameraDeviceSelector();
 
-          if (device_selector == NULL) {
-              ALOGE("%s: create camera hal selector error",__FUNCTION__);
-              return;
-          }
+        if (device_selector == NULL) {
+            return;
+        }
 
-          if (device_selector->selectDevice() != NO_ERROR) {
-              delete device_selector;
-              device_selector = NULL;
-              ALOGE("%s: select device error",__FUNCTION__);
-              return;
-          }
+        if (device_selector->selectDevice() != NO_ERROR) {
+            delete device_selector;
+            device_selector = NULL;
+            ALOGE("select device error");
+            return;
+        }
+        device_selector->resetDeviceIndex();
+        mCameraNum = device_selector->getDevice()->getCameraNum();
+        if (mCameraNum == 0) {
+            ALOGE("real camera number == 0");
+            return;
+        }
 
-          mCameraNum = device_selector->getDevice()->getCameraNum();
-          if (mCameraNum == 0)
-          {
-               ALOGE("real camera number == 0");
-               return;
-          }
-          if (media_profile_camera_num != mCameraNum)
-          {
-               ALOGE("media profile camera num = %d, real number = %d", media_profile_camera_num, mCameraNum);
-          }
+        if (media_profile_camera_num != mCameraNum) {
+            ALOGE("media profile camera num = %d, real number = %d", media_profile_camera_num, mCameraNum);
+        }
 
-          if (mCameraNum > MAX_CAMERAS) {
-               mCameraNum = MAX_CAMERAS;
-          }
+        if (mCameraNum > MAX_CAMERAS) {
+            mCameraNum = MAX_CAMERAS;
+        }
 
-          ALOGE_IF(DEBUG_HALSELECT,"%s: have %d number camera", __FUNCTION__,mCameraNum);
+        ALOGV("%s: have %d number camera", __FUNCTION__,mCameraNum);
 
-          mHal = new CameraHalCommon*[mCameraNum];
-          if (mHal == NULL)
-          {
-               ALOGE("%s: Unable to allocate camera array", __FUNCTION__);
-               return;
-          }
+        mHal = new CameraHalCommon*[mCameraNum];
+        if (mHal == NULL) {
+            ALOGE("%s: Unable to allocate camera array", __FUNCTION__);
+            return;
+        }
 
-          for (int i = 0; i < mCameraNum; ++i)
-               mHal[i] = NULL;
+        for (int i = 0; i < mCameraNum; ++i)
+            mHal[i] = NULL;
+
 #ifdef CAMERA_VERSION1
-          mversion = 1;
-          for (int i = 0; i < mCameraNum; ++i) {
-              mHal[i] = new CameraHal1(i, device_selector->getDevice());
-          }
+        mversion = 1;
+        for (int i = 0; i < mCameraNum; ++i) {
+            mHal[i] = new CameraHal1(i, device_selector->getDevice());
+        }
 #endif
 
 #ifdef CAMERA_VERSION2
-          mversion = 2;
-          for (int i = 0; i < mCameraNum; ++i) {
-              mHal[i] = new CameraHal2(i, device_selector->getDevice());
-          }
+        mversion = 2;
+        for (int i = 0; i < mCameraNum; ++i) {
+            mHal[i] = new CameraHal2(i, device_selector->getDevice());
+        }
 #endif
-     }
 
-     CameraHalSelector::~CameraHalSelector()
-     {
-          if (NULL != mHal)
-          {
-               for (int n = 0; n < mCameraNum; n++) {
-                    if (mHal[n] != NULL) {
-                         delete mHal[n];
-                         mHal[n] = NULL;
-                    }
-               }
-               delete [] mHal;
-               mHal = NULL;
-          }
+    }
 
-          mCurrentId = -1;
-          delete device_selector;
-          device_selector = NULL;
-     }
+    CameraHalSelector::~CameraHalSelector() {
 
-     int CameraHalSelector::get_number_of_cameras(void)
-     {
-          int camera_num = gCameraHalSelector.getNumberCamera();
+        if (NULL != mHal) {
+            for (int n = 0; n < mCameraNum; n++) {
+                if (mHal[n] != NULL) {
+                    delete mHal[n];
+                    mHal[n] = NULL;
+                }
+            }
+            delete [] mHal;
+            mHal = NULL;
+        }
 
-          return camera_num;
-     }
+        mCurrentId = -1;
+        if (device_selector != NULL) {
+            delete device_selector;
+            device_selector = NULL;
+        }
+    }
 
-     int CameraHalSelector::get_profile_number_cameras()
-     {
-          int camera_num = 0;
-          int i = 0;
+    int CameraHalSelector::getNumberCamera(void) {
+        AutoMutex lock(mLock);
 
-          MediaProfiles* profile = MediaProfiles::getInstance();
+        if (device_selector == NULL) {
+            ALOGE("device selector not new is null");
+            mCameraNum = 0;
+            return 0;
+        }
 
-          while (profile->hasCamcorderProfile(i++,CAMCORDER_QUALITY_HIGH))
-               camera_num++;
+        int tmp_num = device_selector->getDevice()->getCameraNum();
+        if (tmp_num >= MAX_CAMERAS) {
+            tmp_num = MAX_CAMERAS;
+        }
+        mCameraNum = tmp_num;
+        return mCameraNum;
+    }
 
-          return camera_num;
-     }
+    int CameraHalSelector::get_number_of_cameras(void) {
+        int camera_num = gCameraHalSelector.getNumberCamera();
 
-     int CameraHalSelector::hw_module_open(const hw_module_t* module,
-                                           const char* id,
-                                           hw_device_t** device)
-     {
-          status_t ret = NO_MEMORY;
+        return camera_num;
+    }
 
-          if ((NULL != gCameraHalSelector.mHal)
-              && (id != NULL)
-              && (gCameraHalSelector.mHal[atoi(id)] != NULL))
-          {
-               gCameraHalSelector.getDeviceSelector()->update_device(gCameraHalSelector.mHal[atoi(id)]);
-               ret = gCameraHalSelector.mHal[atoi(id)]->module_open(module, id, device);
-          }
-          ALOGE_IF(DEBUG_HALSELECT,"open camera %s",id);
-          return ret;
-     }
+    int CameraHalSelector::get_profile_number_cameras() {
 
-     hw_module_methods_t CameraHalSelector::mCameraModuleMethods = {
-          CameraHalSelector::hw_module_open,
-     };
+        int camera_num = 0;
+        int i = 0;
 
-     int CameraHalSelector::get_camera_info(int camera_id, struct camera_info* info)
-     {
-          status_t ret = NO_ERROR;
+        MediaProfiles* profile = MediaProfiles::getInstance();
 
-          info->facing = CAMERA_FACING_BACK;
-          info->orientation = 0;
+        while (profile->hasCamcorderProfile(i++,CAMCORDER_QUALITY_HIGH))
+            camera_num++;
 
-          if (NULL != gCameraHalSelector.mHal && gCameraHalSelector.mHal[camera_id] != NULL)
-          {
-               if (gCameraHalSelector.getCurrentCameraId() != camera_id) {
+        return camera_num;
+    }
+
+    int CameraHalSelector::hw_module_open(const hw_module_t* module,
+                                          const char* id,
+                                          hw_device_t** device) {
+        if (id == NULL) {
+            ALOGE("%s: camera id invalid",__FUNCTION__);
+            return INVALID_OPERATION;
+        }
+        int tmp_id = atoi(id);
+
+        if (tmp_id >= gCameraHalSelector.getNumberCamera()) {
+            ALOGE("%s: don't exist %d camera",__FUNCTION__,tmp_id);
+            return INVALID_OPERATION;
+        }
+
+        for (int i = 0; i < gCameraHalSelector.getNumberCamera(); ++i) {
+            if (gCameraHalSelector.mHal[i] != NULL
+                && gCameraHalSelector.mHal[i]->getModuleInit()) {
+                ALOGE("%s: camera %d already open",__FUNCTION__, i);
+                if (tmp_id == i) {
+                    return OK;
+                } else {
+                    return INVALID_OPERATION;
+                }
+            }
+        }
+
+        if (tmp_id < gCameraHalSelector.getNumberCamera()
+            && gCameraHalSelector.mHal[tmp_id] != NULL) {
+            gCameraHalSelector.getDeviceSelector()->update_device(gCameraHalSelector.mHal[tmp_id], tmp_id);
+            return gCameraHalSelector.mHal[tmp_id]->module_open(module, id, device);
+        }
+
+        return INVALID_OPERATION;
+    }
+
+    hw_module_methods_t CameraHalSelector::mCameraModuleMethods = {
+        CameraHalSelector::hw_module_open,
+    };
+
+    int CameraHalSelector::get_camera_info(int camera_id, struct camera_info* info) {
+
+        status_t ret = NO_ERROR;
+
+        if ((camera_id < 0) || (camera_id >= gCameraHalSelector.getNumberCamera())) {
+            return BAD_VALUE;
+        }
+
+        info->facing = CAMERA_FACING_BACK;
+        info->orientation = 0;
+
+        if (NULL != gCameraHalSelector.mHal && gCameraHalSelector.mHal[camera_id] != NULL)
+            {
+                if (gCameraHalSelector.getCurrentCameraId() != camera_id) {
                     gCameraHalSelector.setCurrentCameraId(camera_id);
-               }
+                }
 
-               ret = gCameraHalSelector.mHal[camera_id]->get_cameras_info(camera_id, info);
-          }
-          return ret;
-     }
-     CameraHalSelector gCameraHalSelector ;
+                ret = gCameraHalSelector.mHal[camera_id]->get_cameras_info(camera_id, info);
+            }
+        return ret;
+    }
+    CameraHalSelector gCameraHalSelector ;
 };

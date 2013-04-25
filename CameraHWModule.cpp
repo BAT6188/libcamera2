@@ -1,5 +1,5 @@
 /*
- * Camera HAL for Ingenic android 4.1
+ * Camera HAL for Ingenic android 4.2
  *
  * Copyright 2012 Ingenic Semiconductor LTD.
  *

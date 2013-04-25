@@ -23,7 +23,6 @@ extern "C" {
 #include <fd_emb_sdk.h>
 }
 
-
 #define MAX(x, y) (x)>(y) ? (x) : (y)
 
 namespace android {
@@ -47,22 +46,15 @@ namespace android {
     class CameraFaceDetect {
 
     protected:
-
         CameraFaceDetect();
-     public:
-
-          static Mutex sLock;
-          static CameraFaceDetect* sInstance;
     public:
-          
+        static Mutex sLock;
+        static CameraFaceDetect* sInstance;
+    public:
         static CameraFaceDetect* getInstance();
-
     public:
-
         virtual ~CameraFaceDetect();
-
     public:
-
         int initialize(int w, int h, int maxFaces=1);
         int detect(uint16_t* imge);
         void get_face(Rect* r, int index);

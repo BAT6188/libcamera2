@@ -17,106 +17,135 @@
 #include "CameraColorConvert.h"
 #include "CameraFaceDetect.h"
 
+//#define USE_X2D
 #define X2D_NAME "/dev/x2d"
 #define X2D_SCALE_FACTOR 512.0
+
+#define SIGNAL_RESET_PREVIEW     (SIGNAL_THREAD_COMMON_LAST<<1)
+#define SIGNAL_TAKE_PICTURE      (SIGNAL_THREAD_COMMON_LAST<<2)
+#define SIGNAL_RECORDING_START      (SIGNAL_THREAD_COMMON_LAST<<3)
 
 namespace android {
 
     class CameraHal1 : public CameraHalCommon {
 
     public:
-
         CameraHal1(int id, CameraDeviceCommon* device);
-
         ~CameraHal1();
 
     public:
-	  
         void update_device(CameraDeviceCommon* device);
-
         int module_open(const hw_module_t* module, const char* id, hw_device_t** device);
 
-        int get_number_cameras(void);
+        bool getModuleInit() {
+            return mModuleOpened;
+        }
 
+        int get_number_cameras(void);
         int get_cameras_info(int camera_id, struct camera_info* info);
 
     public:
-
         status_t initialize(void);
-	  
-        virtual status_t setPreviewWindow(struct preview_stream_ops *window);
-
-        virtual void setCallbacks(camera_notify_callback notify_cb,
+        status_t setPreviewWindow(struct preview_stream_ops *window);
+        void setCallbacks(camera_notify_callback notify_cb,
                                   camera_data_callback data_cb,
                                   camera_data_timestamp_callback data_cb_timestamp,
                                   camera_request_memory get_memory,
                                   void* user);
-
-        virtual void enableMsgType(int32_t msg_type);
-
-        virtual void disableMsgType(int32_t msg_type);
-
-        virtual int isMsgTypeEnabled(int32_t msg_type);
-
-        virtual status_t startPreview(void);
-
-        virtual void stopPreview(void);
-
-        virtual int isPreviewEnabled(void);
-
-        virtual status_t storeMetaDataInBuffers(int enable);
-
-        virtual status_t startRecording(void);
-
-        virtual void stopRecording(void);
-
-        virtual int isRecordingEnabled(void);
-
-        virtual void releaseRecordingFrame(const void* opaque);
-
-        virtual status_t setAutoFocus(void);
-
-        virtual status_t cancelAutoFocus(void);
-
-        virtual status_t takePicture(void);
-
-        virtual status_t cancelPicture(void);
-
-        virtual status_t setParameters(const char* parms);
-
-        virtual char* getParameters(void);
-
-        virtual void putParameters(char* params);
-
-        virtual status_t sendCommand(int32_t cmd, int32_t arg1, int32_t arg2);
-
-        virtual void releaseCamera(void);
-
-        virtual status_t dumpCamera(int fd);
-
-        virtual int deviceClose(void);
+        void enableMsgType(int32_t msg_type);
+        void disableMsgType(int32_t msg_type);
+        int isMsgTypeEnabled(int32_t msg_type);
+        status_t startPreview(void);
+        void stopPreview(void);
+        int isPreviewEnabled(void);
+        status_t storeMetaDataInBuffers(int enable);
+        status_t startRecording(void);
+        void stopRecording(void);
+        int isRecordingEnabled(void);
+        void releaseRecordingFrame(const void* opaque);
+        status_t setAutoFocus(void);
+        status_t cancelAutoFocus(void);
+        status_t takePicture(void);
+        status_t cancelPicture(void);
+        status_t setParameters(const char* parms);
+        char* getParameters(void);
+        void putParameters(char* params);
+        status_t sendCommand(int32_t cmd, int32_t arg1, int32_t arg2);
+        void releaseCamera(void);
+        status_t dumpCamera(int fd);
+        int deviceClose(void);
 
     private:
-	  
+
         bool NegotiatePreviewFormat(struct preview_stream_ops* win);
         void initVideoHeap(int w, int h);
-        void initPreviewHeap(int w, int h);
+        void initPreviewHeap(void);
+        void resetPreview(void);
+        void open_ipu_dev(void);
 
-        int open_ipu_dev(void);
-
-        int init_ipu_dev(int w, int h, int f);
+        int init_ipu_dev(int w, int h, int mat, int must_do);
 
         void close_ipu_dev(void);
+
+        void open_x2d_dev(void);
+
+        void close_x2d_dev(void);
 
         CameraDeviceCommon* getDevice(void) {
             return mDevice;
         }
 
+        size_t num2even(int num){
+            size_t even;
+
+            even = num % 2 ? num-1 : num;
+            if(even == 682)
+                even = 708;
+            else if(even == 778)
+                even = 776;
+
+            return even;
+        }
+
+        void dmmu_map_memory(uint8_t* addr, int size) {
+            struct dmmu_mem_info dmmu_info;
+
+            dmmu_info.vaddr = (void*)addr;
+            dmmu_info.size = size;
+            for (int i = 0; i < (int)size; i += 0x1000) {
+                addr[i] = 0;
+            }
+            addr[size - 1] = 0;
+            dmmu_map_user_memory(&dmmu_info);
+        }
+
+        void dmmu_unmap_memory(uint8_t* addr, int size) {
+            struct dmmu_mem_info dmmu_info;
+
+            dmmu_info.vaddr = (void*)addr;
+            dmmu_info.size = size;
+            dmmu_unmap_user_memory(&dmmu_info);
+        }
+
+        unsigned int GetTimer(void)
+        {
+            struct timeval tv;
+            //float s;
+            gettimeofday(&tv,NULL);
+            return tv.tv_sec * 1000000 + tv.tv_usec;
+        }
+
+        void do_zoom(uint8_t* dest, uint8_t* src);
+
         void ipu_convert_dataformat(CameraYUVMeta* yuvMeta,
-                                    uint8_t* dst_buf, buffer_handle_t *buffer);
+             uint8_t* dst_buf, buffer_handle_t *buffer);
+        status_t ipu_zoomIn_scale(uint8_t* dest, int dest_width, int dest_height,
+                 uint8_t* src, int src_width, int src_height, int src_format, int stride_mul, int src_stride);
 
         void x2d_convert_dataformat(CameraYUVMeta* yuvMeta, 
                                     uint8_t* dst_buf, buffer_handle_t *buffer);
+
+        void dump_data(bool isdump);
 
     private:
 
@@ -126,6 +155,7 @@ namespace android {
         CameraDeviceCommon* mDevice;
         CameraColorConvert* ccc;
         camera_device_t* mCameraModuleDev;
+        bool mModuleOpened;
 
         camera_notify_callback mnotify_cb;
         camera_data_callback mdata_cb ;
@@ -135,27 +165,33 @@ namespace android {
 
         JZCameraParameters* mJzParameters;
         int32_t mMesgEnabled;
-	  
+
         preview_stream_ops* mPreviewWindow;
         nsecs_t mPreviewAfter;
         int mRawPreviewWidth;
         int mRawPreviewHeight;
 
         int mPreviewFmt;
-        int mDeviceDataFmt;
+        int mPreviewWidth;
+        int mPreviewHeight;
         int mPreviewFrameSize;
         camera_memory_t* mPreviewHeap;
         int mPreviewIndex;
+        mutable Mutex mcapture_lock;
+        List<camera_memory_t*> mListCaptureHeap;
 
         bool mPreviewEnabled;
-        int mRecFmt;
         int mRecordingFrameSize;
         camera_memory_t* mRecordingHeap;
         int mRecordingindex;
         bool mVideoRecEnabled;
+        int mtotaltime;
+        int mtotalnum;
         bool mTakingPicture;
-
+        int mPicturewidth;
+        int mPictureheight;
         int mPreviewWinFmt;
+        int mPrebytesPerPixel;
         int mPreviewWinWidth;
         int mPreviewWinHeight;
 
@@ -163,62 +199,125 @@ namespace android {
         nsecs_t mLastFrameTimestamp;
         CameraYUVMeta* mCurrentFrame;
         int mFaceCount;
+        int mzoomVal;
+        int mzoomRadio;
 
         bool isSoftFaceDetectStart;
         struct ipu_image_info * mipu;
         bool ipu_open_status;
-        bool first_init_ipu;
+        bool init_ipu_first;
         int x2d_fd;
-        int mdrop_frame;
+
+        volatile bool mreceived_cmd;
+        mutable Mutex cmd_lock;
+        Condition mreceivedCmdCondition;
+
+        sp<SensorListener> mSensorListener;
+    private:
+        bool thread_body(void);
+        void postFrameForPreview(void);
+        void postFrameForNotify(void);
+        void postJpegDataToApp(void);
+        void softCompressJpeg(void);
+        void hardCompressJpeg(void);
+        status_t fillCurrentFrame(uint8_t* img,buffer_handle_t* buffer);
+        status_t convertCurrentFrameToJpeg(camera_memory_t** jpeg_buff);
+        status_t softFaceDetectStart(int32_t detect_type);
+        status_t softFaceDetectStop(void);
+        status_t do_takePictureWithPreview(void);
+        status_t do_takePicture(void);
+        status_t completeTakePicture(void);
+        void completeRecordingVideo(void);
+        int getCurrentFrameSize(void);
 
     private:
+        friend class Hal1SignalThread;
+        class Hal1SignalThread : public SignalDrivenThread {
 
-        virtual bool thread_body_preview(void);
-        virtual bool thread_body_capture(void);
+        private:
+            CameraHal1* signalHal1;
 
-        status_t freePreview();
-        status_t readyToPreview();
-        status_t readyToCapture();
-        void cameraCapture();
+        public:
+             Hal1SignalThread(CameraHal1* hal)
+                : SignalDrivenThread() {
+                signalHal1 = hal;
+            }
 
-        virtual void postFrameForPreview(void);
-        virtual void postFrameForNotify(void);
-        virtual void postJpegDataToApp(void);
-        virtual void softCompressJpeg(void);
-        virtual void hardCompressJpeg(void);
-        virtual status_t fillCurrentFrame(uint8_t* img,buffer_handle_t* buffer);
-        virtual status_t convertCurrentFrameToJpeg(camera_memory_t** jpeg_buff);
-        virtual status_t softFaceDetectStart(int32_t detect_type);
-        virtual status_t softFaceDetectStop(void);
+            ~Hal1SignalThread() {
+            }
 
-	private:
-        enum CAMERA_STATE {
-            START_PREVIEW,
-            RUN_PREVIEW,
-            STOP_PREVIEW,
-            FREE_PREVIEW,
-            START_CAPTURE,
-            RUN_CAPTURE,
-            STOP_CAPTURE,
-            CAPTURE_STOP_PREVIEW,
-            CAPTURE_TO_PREVIEW,
-            START_RECORD,
-            RUN_RECORD,
-            STOP_RECORD,
+            void release() {
+                SetSignal(SIGNAL_THREAD_TERMINATE);
+            }
 
-            CAMERA_NONE,
-            CAMERA_ERROR,
+            status_t readyToRunInternal(void) {
+                return NO_ERROR;
+            }
+
+            void threadFuntionInternal(void) {
+                uint32_t signal = GetProcessingSignal();
+                if (signal & SIGNAL_THREAD_TERMINATE) {
+                    SetSignal(SIGNAL_THREAD_TERMINATE);
+                } else if (signal & SIGNAL_RESET_PREVIEW) {
+                    signalHal1->resetPreview();
+                } else if (signal & SIGNAL_TAKE_PICTURE) {
+                    signalHal1->completeTakePicture();
+                }
+                return;
+            }
         };
-        CAMERA_STATE prev_camera_state;
-        CAMERA_STATE camera_state;
-        mutable Mutex camera_state_lock;
-        Condition camera_state_cond;
 
+    private:
+        sp<Hal1SignalThread> mHal1SignalThread;
+
+    private:
+        friend class Hal1SignalRecordingVideo;
+        class Hal1SignalRecordingVideo : public SignalDrivenThread {
+
+        private:
+            CameraHal1* signalHal1;
+
+        public:
+             Hal1SignalRecordingVideo(CameraHal1* hal)
+                : SignalDrivenThread() {
+                signalHal1 = hal;
+            }
+
+            ~Hal1SignalRecordingVideo() {
+            }
+
+            void release() {
+                SetSignal(SIGNAL_THREAD_TERMINATE);
+            }
+
+            status_t readyToRunInternal(void) {
+                return NO_ERROR;
+            }
+
+            void threadFuntionInternal(void) {
+                uint32_t signal = GetProcessingSignal();
+                if (signal & SIGNAL_THREAD_TERMINATE) {
+                    SetSignal(SIGNAL_THREAD_TERMINATE);
+                } else if (signal & SIGNAL_RECORDING_START) {
+                    signalHal1->completeRecordingVideo();
+                }
+                return;
+            }
+        };
+
+    private:
+        sp<Hal1SignalRecordingVideo> mHal1SignalRecordingVideo;
+        Vector<camera_memory_t*> mRecordingDataQueue;
+        mutable Mutex recordingDataQueueLock;
+
+    private:
         friend class WorkThread;
         class WorkThread : public Thread {
 
         private:
             CameraHal1* mCameraHal;
+            int mThreadControl;
+            int mControlFd;
             bool mOnce;
             mutable Mutex release_recording_frame_lock;
             Condition release_recording_frame_condition;
@@ -229,18 +328,20 @@ namespace android {
 
         public:
             enum ControlCmd {
-                TIMEOUT,
-                READY,
-                EXIT_THREAD,
+                THREAD_TIMEOUT,
+                THREAD_READY,
+                THREAD_IDLE,
+                THREAD_EXIT,
                 THREAD_STOP,
-                ERROR
+                THREAD_ERROR
             };
-
 
         public:
             inline explicit WorkThread(CameraHal1 * ch1)
                 :Thread(false),
                  mCameraHal(ch1),
+                 mThreadControl(-1),
+                 mControlFd(-1),
                  mOnce(false),
                  release_recording_frame_lock("WorkThread::lock"),
                  mrelease_recording_frame(0),
@@ -249,19 +350,25 @@ namespace android {
                  timeout(3000000000LL)
             {
             }
-	       
+
             inline ~WorkThread()
             {
-
+                if (mThreadControl >= 0)
+                    close(mThreadControl);
+                if (mControlFd >= 0)
+                    close(mControlFd);
+                mThreadControl = -1;
+                mControlFd = -1;
             }
 
             inline status_t startThread(bool once)
             {
                 mOnce = once;
-                return run (NULL, ANDROID_PRIORITY_URGENT_DISPLAY, 0);
+                return run ("CameraThread", ANDROID_PRIORITY_URGENT_DISPLAY, 0);
             }
 
-            void threadResume(void) {
+            void threadResume(void)
+            {
                 AutoMutex lock(release_recording_frame_lock);
                 changed = true;
                 timeout = systemTime(SYSTEM_TIME_MONOTONIC) - start;
@@ -269,7 +376,8 @@ namespace android {
                 release_recording_frame_condition.signal();
             }
 
-            void threadPause(void) {
+            void threadPause(void)
+            {
                 AutoMutex lock(release_recording_frame_lock);
 
                 if (changed) {
@@ -277,7 +385,7 @@ namespace android {
                     start = systemTime(SYSTEM_TIME_MONOTONIC);
                 }
 
-                while (mrelease_recording_frame == PREVIEW_BUFFER_CONUT) {
+                while (mrelease_recording_frame == RECORDING_BUFFER_NUM) {
                     release_recording_frame_condition.waitRelative(release_recording_frame_lock,
                                                                    timeout);
                 }
@@ -286,19 +394,81 @@ namespace android {
             }
 
             status_t readyToRun() {
-                status_t res = NO_ERROR;
-                changed = true;
-                start = 0;
-                timeout = 3000000000LL;
-                mCameraHal->mdrop_frame = 0;
 
-                return NO_ERROR;
+                int thread_fds[2];
+                if (pipe(thread_fds) == 0) {
+                    mThreadControl = thread_fds[1]; //write
+                    mControlFd = thread_fds[0]; //read
+#ifdef USE_X2D
+                    mCameraHal->open_x2d_dev();
+#else
+                    mCameraHal->open_ipu_dev();
+#endif
+                    changed = true;
+                    start = 0;
+                    timeout = 3000000000LL;
+
+                    return NO_ERROR;
+                }
+
+                return errno;
             }
 
-            status_t stopThread();
+            int sendMesg(ControlCmd msg) {
+                return sendMesgDelay(msg, 0);
+            }
 
+            int sendMesgDelay(ControlCmd msg, int64_t delay) {
+
+                struct timespec req;
+                memset(&req, 0, sizeof(struct timespec));
+                req.tv_sec = delay / 1000000000LL;
+                req.tv_nsec = (delay - (req.tv_sec *1000000000LL));
+                if (mThreadControl >= 0) {
+                    nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
+                    nsecs_t uptime = now + delay;
+                    while (uptime > systemTime(SYSTEM_TIME_MONOTONIC))
+                        nanosleep(&req, &req);
+                    const int wres = write(mThreadControl, &msg, sizeof(msg));
+                    if (wres == sizeof(msg)) {
+                        return 0;
+                    }
+                }
+                ALOGE("%s: send cmd %d error, contorl fd:%d",__FUNCTION__,
+                      msg, mThreadControl);
+                return -1;
+            }
+
+            status_t stopThread() {
+
+                status_t res = NO_ERROR;
+                if (mThreadControl >= 0) {
+                    const ControlCmd cmd = THREAD_EXIT;
+                    const int wres = write(mThreadControl,&cmd,sizeof(cmd));
+
+                    if (wres == sizeof(cmd)) {
+                        res = requestExitAndWait();
+                    }
+
+                    if (res == NO_ERROR) {
+                        close(mThreadControl);
+                        close(mControlFd);
+                        mThreadControl = -1;
+                        mControlFd = -1;
+                    }
+                }
+                return res;
+            }
+            ControlCmd receiveCmd(int fd, int64_t timeout);
         private:
-            bool threadLoop();
+            bool threadLoop()
+            {
+                if (mCameraHal->thread_body())
+                    {
+                        return !mOnce;
+                    }
+                return false;
+            }
         };
 
         inline WorkThread* getWorkThread()
@@ -307,51 +477,58 @@ namespace android {
         }
 
     private:
-
         sp<WorkThread> mWorkerThread;
 
     private:
-
         bool startAutoFocus();
         friend class AutoFocusThread;
         class AutoFocusThread : public Thread {
         private:
             CameraHal1* mCameraHal;
-               
+            bool stoped;
         public:
             inline explicit AutoFocusThread(CameraHal1* ch1)
-                :Thread(false)
+                :Thread(false),
+                stoped(true)
             {
                 mCameraHal = ch1;
             }
 
             inline status_t startThread()
             {
-                return run (NULL, ANDROID_PRIORITY_URGENT_DISPLAY, 0);
+                return run ("FocusThread",
+                    ANDROID_PRIORITY_URGENT_DISPLAY, 0);
             }
 
             inline status_t stopThread()
             {
-                return requestExitAndWait();
+                if (!stoped) {
+                    requestExit();
+                }
+                return NO_ERROR;
             }
 
         private:
             bool threadLoop()
             {
-                return mCameraHal->startAutoFocus();
+                stoped = !mCameraHal->startAutoFocus();
+                return false;
             }
         };
 
-    private:
+        inline AutoFocusThread* getAutoFocusThread()
+        {
+            return mFocusThread.get();
+        }
 
+    private:
         sp<AutoFocusThread> mFocusThread;
 
     private:
         friend class PostJpegUnit;
         class PostJpegUnit : public WorkQueue::WorkUnit {
-	       
-        private:
 
+        private:
             CameraHal1* mhal;
 
         public:
@@ -359,11 +536,31 @@ namespace android {
                 WorkQueue::WorkUnit(),mhal(hal)
             {
             }
-	       
+
             bool run() {
-		    
+
                 if (mhal != NULL) {
                     mhal->postJpegDataToApp();
+                }
+                return true;
+            }
+        };
+    private:
+        friend class completeTakePictureUnit;
+        class completeTakePictureUnit : public WorkQueue::WorkUnit {
+
+        private:
+            CameraHal1* mhal;
+
+        public:
+            completeTakePictureUnit(CameraHal1* hal):
+                WorkQueue::WorkUnit(),mhal(hal)
+            {
+            }
+
+            bool run() {
+                if (mhal != NULL) {
+                    mhal->completeTakePicture();
                 }
                 return true;
             }
@@ -373,7 +570,6 @@ namespace android {
         WorkQueue* mWorkerQueue;
 
     public:
-
         static camera_device_ops_t mCamera1Ops;
 
         /**
